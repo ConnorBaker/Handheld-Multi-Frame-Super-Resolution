@@ -65,7 +65,7 @@ def test_compute_grey_images_decimate_equal(image_shape: tuple[int, int], seed: 
 )
 @pytest.mark.parametrize("seed", [0, 1, 2, 3, 4])
 @pytest.mark.parametrize("downsample_factor", [1, 2, 4])
-def test_downsample(image_shape: tuple[int, int], seed: int, downsample_factor: int):
+def test_downsample_equal(image_shape: tuple[int, int], seed: int, downsample_factor: int):
     # Test that the two functions compute the same result
     np.random.seed(seed)
     image = np.random.rand(*image_shape).astype(np.float32)

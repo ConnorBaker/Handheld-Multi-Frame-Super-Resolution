@@ -152,9 +152,14 @@ def compute_grey_images(img, method):
         Corresponding grey scale image G
 
     """
+    img = cp.array(img)
     if method == "FFT":
+        # Originally:
+        # return compute_grey_images_fft_torch(img)
         return compute_grey_images_fft_cupy(img)
     elif method == "decimating":
+        # Originally:
+        # return compute_grey_images_decimate_numba(img)
         return compute_grey_images_decimate_cupy(img)
     else:
         raise NotImplementedError(
