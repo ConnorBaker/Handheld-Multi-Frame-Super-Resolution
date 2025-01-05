@@ -14,6 +14,7 @@ method.
 import time
 import math
 
+import cupy as cp
 import numpy as np
 from numba import cuda
 import torch
@@ -27,7 +28,82 @@ from .utils import (
     DEFAULT_TORCH_FLOAT_TYPE,
     DEFAULT_THREADS,
 )
-from .utils_image import cuda_downsample
+from .utils_image import cupy_downsample
+
+
+def init_block_matching_torch(ref_img, options, params):
+    # Initialization.
+    h, w = ref_img.shape  # height and width should be identical for all images
+
+    tileSize = params["tuning"]["tileSizes"][0]
+
+    # if needed, pad images with zeros so that getTiles contains all image pixels
+    paddingPatchesHeight = (tileSize - h % (tileSize)) * (h % (tileSize) != 0)
+    paddingPatchesWidth = (tileSize - w % (tileSize)) * (w % (tileSize) != 0)
+
+    # combine the two to get the total padding
+    paddingTop = 0
+    paddingBottom = paddingPatchesHeight
+    paddingLeft = 0
+    paddingRight = paddingPatchesWidth
+
+    # pad all images (by mirroring image edges)
+    th_ref_img = torch.as_tensor(
+        ref_img, dtype=DEFAULT_TORCH_FLOAT_TYPE, device="cuda"
+    )[None, None]
+    # TODO: Why are left/right first? If the image is hxw, shouldn't it be top/bottom first?
+    th_ref_img_padded = F.pad(
+        th_ref_img, (paddingLeft, paddingRight, paddingTop, paddingBottom), "circular"
+    )
+
+    # For convenience
+    currentTime, verbose = time.perf_counter(), options["verbose"] > 2
+    # factors, tileSizes, distances, searchRadia and subpixels are described fine-to-coarse
+    factors = params["tuning"]["factors"]
+
+    # construct 4-level coarse-to fine pyramid of the reference
+    referencePyramid = hdrplusPyramid(th_ref_img_padded, factors)
+    if verbose:
+        currentTime = getTime(currentTime, " --- Create ref pyramid")
+
+    return referencePyramid
+
+
+def init_block_matching_cupy(ref_img, options, params):
+    # Initialization.
+    ref_img = cp.array(ref_img)
+    h, w = ref_img.shape  # height and width should be identical for all images
+
+    tileSize = params["tuning"]["tileSizes"][0]
+
+    # if needed, pad images with zeros so that getTiles contains all image pixels
+    paddingPatchesHeight = (tileSize - h % (tileSize)) * (h % (tileSize) != 0)
+    paddingPatchesWidth = (tileSize - w % (tileSize)) * (w % (tileSize) != 0)
+
+    # combine the two to get the total padding
+    paddingTop = 0
+    paddingBottom = paddingPatchesHeight
+    paddingLeft = 0
+    paddingRight = paddingPatchesWidth
+
+    # pad all images (by mirroring image edges)
+    ref_img_padded = cp.pad(
+        ref_img,
+        ((paddingTop, paddingBottom), (paddingLeft, paddingRight)),
+        "wrap",
+    )[None, None]
+
+    # For convenience
+    currentTime, verbose = time.perf_counter(), options["verbose"] > 2
+    # factors, tileSizes, distances, searchRadia and subpixels are described fine-to-coarse
+    factors = params["tuning"]["factors"]
+
+    # construct 4-level coarse-to fine pyramid of the reference
+    referencePyramid = hdrplusPyramid(ref_img_padded, factors)
+    if verbose:
+        currentTime = getTime(currentTime, " --- Create ref pyramid")
+
+    return referencePyramid
 
 
 def init_block_matching(ref_img, options, params):
@@ -50,45 +126,7 @@ def init_block_matching(ref_img, options, params):
         pyramid representation of the image
 
     """
-    # Initialization.
-    h, w = ref_img.shape  # height and width should be identical for all images
-
-    tileSize = params["tuning"]["tileSizes"][0]
-
-    # if needed, pad images with zeros so that getTiles contains all image pixels
-    paddingPatchesHeight = (tileSize - h % (tileSize)) * (h % (tileSize) != 0)
-    paddingPatchesWidth = (tileSize - w % (tileSize)) * (w % (tileSize) != 0)
-
-    # combine the two to get the total padding
-    paddingTop = 0
-    paddingBottom = paddingPatchesHeight
-    paddingLeft = 0
-    paddingRight = paddingPatchesWidth
-
-    # pad all images (by mirroring image edges)
-    # separate reference and alternate images
-    # ref_img_padded = np.pad(ref_img, ((paddingTop, paddingBottom), (paddingLeft, paddingRight)), 'symmetric')
-
-    th_ref_img = torch.as_tensor(
-        ref_img, dtype=DEFAULT_TORCH_FLOAT_TYPE, device="cuda"
-    )[None, None]
-
-    th_ref_img_padded = F.pad(
-        th_ref_img, (paddingLeft, paddingRight, paddingTop, paddingBottom), "circular"
-    )
-
-    # For convenience
-    currentTime, verbose = time.perf_counter(), options["verbose"] > 2
-    # factors, tileSizes, distances, searchRadia and subpixels are described fine-to-coarse
-    factors = params["tuning"]["factors"]
-
-    # construct 4-level coarse-to fine pyramid of the reference
-
-    referencePyramid = hdrplusPyramid(th_ref_img_padded, factors)
-    if verbose:
-        currentTime = getTime(currentTime, " --- Create ref pyramid")
-
-    return referencePyramid
+    return init_block_matching_cupy(ref_img, options, params)
 
 
 def align_image_block_matching(img, referencePyramid, options, params, debug=False):
@@ -197,19 +235,20 @@ def hdrplusPyramid(image, factors=[1, 2, 4, 4], kernel="gaussian"):
             image: input image (expected to be a grayscale image downsampled from a Bayer raw image)
             factors: [int], dowsampling factors (fine-to-coarse)
             kernel: convolution kernel to apply before downsampling (default: gaussian kernel)"""
+    image = cp.array(image)
     # Start with the finest level computed from the input
-    pyramidLevels = [cuda_downsample(image, kernel, factors[0])]
-    # pyramidLevels = [downsample(image, kernel, factors[0])]
+    # pyramidLevels = [cuda_downsample(image, kernel, factors[0])]
+    pyramidLevels = [cupy_downsample(image, kernel, factors[0])]
 
     # Subsequent pyramid levels are successively created
     # with convolution by a kernel followed by downsampling
     for factor in factors[1:]:
-        pyramidLevels.append(cuda_downsample(pyramidLevels[-1], kernel, factor))
-        # pyramidLevels.append(downsample(pyramidLevels[-1], kernel, factor))
+        # pyramidLevels.append(cuda_downsample(pyramidLevels[-1], kernel, factor))
+        pyramidLevels.append(cupy_downsample(pyramidLevels[-1], kernel, factor))
 
     # torch to numba, remove batch, channel dimensions
     for i, pyramidLevel in enumerate(pyramidLevels):
-        pyramidLevels[i] = cuda.as_cuda_array(pyramidLevel.squeeze())
+        pyramidLevels[i] = pyramidLevel.squeeze()
 
     # Reverse the pyramid to get it coarse-to-fine
     return pyramidLevels[::-1]
