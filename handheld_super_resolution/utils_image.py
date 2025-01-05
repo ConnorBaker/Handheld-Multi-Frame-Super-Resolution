@@ -1,4 +1,5 @@
 import math
+import time
 
 import cupy as cp
 import cupyx.scipy.ndimage as ndx
@@ -11,6 +12,7 @@ import torch.nn.functional as F
 
 from .utils import (
     getSigned,
+    getTime,
     DEFAULT_NUMPY_FLOAT_TYPE,
     DEFAULT_CUDA_FLOAT_TYPE,
     DEFAULT_TORCH_FLOAT_TYPE,
@@ -166,6 +168,82 @@ def compute_grey_images(img, method):
             "Computation of gray level on GPU is only supported for FFT"
         )
 
+
+def compute_gradient_torch(ref_img, options, kanade_params):
+    current_time, verbose_3 = time.perf_counter(), options["verbose"] >= 3
+
+    sigma_blur = kanade_params["tuning"]["sigma blur"]
+
+    # Estimating gradients with Prewitt kernels
+    kernely = np.array([[-1], [0], [1]])
+
+    kernelx = np.array([[-1, 0, 1]])
+
+    # translating ref_img numba pointer to pytorch
+    # the type needs to be explicitely specified. Filters need to be casted to float to perform convolution
+    # on float image
+    th_ref_img = torch.as_tensor(
+        ref_img, dtype=DEFAULT_TORCH_FLOAT_TYPE, device="cuda"
+    )[None, None]
+    th_kernely = torch.as_tensor(
+        kernely, dtype=DEFAULT_TORCH_FLOAT_TYPE, device="cuda"
+    )[None, None]
+    th_kernelx = torch.as_tensor(
+        kernelx, dtype=DEFAULT_TORCH_FLOAT_TYPE, device="cuda"
+    )[None, None]
+
+    # adding 2 dummy dims for batch, channel, to use torch convolve
+    if sigma_blur != 0:
+        # This is the default kernel of scipy gaussian_filter1d
+        # Note that pytorch Convolve is actually a correlation, hence the ::-1 flip.
+        # copy to avoid negative stride (not supported by torch)
+        gaussian_kernel = _gaussian_kernel1d(
+            sigma=sigma_blur, order=0, radius=int(4 * sigma_blur + 0.5)
+        )[::-1].copy()
+        th_gaussian_kernel = torch.as_tensor(
+            gaussian_kernel, dtype=DEFAULT_TORCH_FLOAT_TYPE, device="cuda"
+        )[None, None]
+
+        # 2 times gaussian 1d is faster than gaussian 2d
+        th_ref_img = F.conv2d(
+            th_ref_img, th_gaussian_kernel[:, None], padding="same"
+        )  # convolve y
+        th_ref_img = F.conv2d(th_ref_img, th_gaussian_kernel[None, :], padding="same")  # convolve x
+
+    th_grady = F.conv2d(th_ref_img, th_kernely, padding="same").squeeze()
+    th_gradx = F.conv2d(
+        th_ref_img, th_kernelx, padding="same"
+    ).squeeze()  # 1 batch, 1 channel
+
+    # swapping grads back to numba
+    cuda_grady = cuda.as_cuda_array(th_grady)
+    cuda_gradx = cuda.as_cuda_array(th_gradx)
+
+    if verbose_3:
+        cuda.synchronize()
+        current_time = getTime(current_time, " -- Gradients estimated")
+    
+    return cuda_grady, cuda_gradx
+
+
+def compute_gradient_cupy(ref_img, options, kanade_params):
+    current_time, verbose_3 = time.perf_counter(), options["verbose"] >= 3
+
+    sigma_blur = kanade_params["tuning"]["sigma blur"]
+
+    # translating ref_img numba pointer to pytorch
+    cp_ref_img = cp.array(ref_img, dtype=cp.float32)
+
+    if sigma_blur != 0:
+        cp_ref_img = ndx.gaussian_filter(cp_ref_img, sigma=sigma_blur)
+
+    cp_grady, cp_gradx = cp.gradient(cp_ref_img, edge_order=2)
+
+    if verbose_3:
+        cuda.synchronize()
+        current_time = getTime(current_time, " -- Gradients estimated")
+    
+    return cp_grady, cp_gradx
 
 def GAT(image, alpha, beta):
     """
