@@ -208,7 +208,9 @@ def compute_gradient_torch(ref_img, options, kanade_params):
         th_ref_img = F.conv2d(
             th_ref_img, th_gaussian_kernel[:, None], padding="same"
         )  # convolve y
-        th_ref_img = F.conv2d(th_ref_img, th_gaussian_kernel[None, :], padding="same")  # convolve x
+        th_ref_img = F.conv2d(
+            th_ref_img, th_gaussian_kernel[None, :], padding="same"
+        )  # convolve x
 
     th_grady = F.conv2d(th_ref_img, th_kernely, padding="same").squeeze()
     th_gradx = F.conv2d(
@@ -222,7 +224,7 @@ def compute_gradient_torch(ref_img, options, kanade_params):
     if verbose_3:
         cuda.synchronize()
         current_time = getTime(current_time, " -- Gradients estimated")
-    
+
     return cuda_grady, cuda_gradx
 
 
@@ -242,8 +244,114 @@ def compute_gradient_cupy(ref_img, options, kanade_params):
     if verbose_3:
         cuda.synchronize()
         current_time = getTime(current_time, " -- Gradients estimated")
-    
+
     return cp_grady, cp_gradx
+
+
+def compute_hessian_cupy(cuda_grady, cuda_gradx, options, kanade_params):
+    current_time, verbose_3 = time.perf_counter(), options["verbose"] >= 3
+    tile_size = kanade_params["tuning"]["tileSize"]
+
+    cuda_grady = cp.array(cuda_grady)
+    cuda_gradx = cp.array(cuda_gradx)
+
+    H, W = cuda_gradx.shape
+
+    # image is padded during BM, we need to consider that to count patches
+    n_patch_y = math.ceil(float(H) / tile_size)
+    n_patch_x = math.ceil(float(W) / tile_size)
+
+    # Pad to fill the last patch
+    gy = cp.pad(
+        cuda_grady, ((0, n_patch_y * tile_size - H), (0, n_patch_x * tile_size - W))
+    )
+    gx = cp.pad(
+        cuda_gradx, ((0, n_patch_y * tile_size - H), (0, n_patch_x * tile_size - W))
+    )
+
+    # Reshape to patches
+    gy = gy.reshape(n_patch_y, tile_size, n_patch_x, tile_size)
+    gx = gx.reshape(n_patch_y, tile_size, n_patch_x, tile_size)
+
+    # Compute each term
+    gy2 = (gy**2).sum(axis=(1, 3))
+    gx2 = (gx**2).sum(axis=(1, 3))
+    cross = (gx * gy).sum(axis=(1, 3))
+
+    # Create output Hessian
+    hessian = cp.zeros((n_patch_y, n_patch_x, 2, 2), dtype=cuda_gradx.dtype)
+    hessian[..., 0, 0] = gx2
+    hessian[..., 0, 1] = cross
+    hessian[..., 1, 0] = cross
+    hessian[..., 1, 1] = gy2
+
+    if verbose_3:
+        cuda.synchronize()
+        current_time = getTime(current_time, " -- Hessian estimated")
+
+    return hessian
+
+
+def compute_hessian_numba(cuda_grady, cuda_gradx, options, kanade_params):
+    @cuda.jit
+    def compute_hessian(grady, gradx, tile_size, hessian):
+        patch_idy, patch_idx = cuda.grid(2)
+        n_patchy, n_patch_x, _, _ = hessian.shape
+
+        # discarding non existing patches
+        if patch_idy >= n_patchy or patch_idx >= n_patch_x:
+            return
+
+        H, W = gradx.shape
+
+        # global position on the coarse grey grid. Because of extremity padding, it can be out of bound
+        patch_pos_idy = tile_size * patch_idy
+        patch_pos_idx = tile_size * patch_idx
+
+        for j in range(tile_size):
+            pixel_global_idy = patch_pos_idy + j
+            if pixel_global_idy >= H:
+                continue
+
+            for i in range(tile_size):
+                pixel_global_idx = patch_pos_idx + i
+                if pixel_global_idx >= W:
+                    continue
+
+                local_grady = grady[pixel_global_idy, pixel_global_idx]
+                local_gradx = gradx[pixel_global_idy, pixel_global_idx]
+
+                hessian[patch_idy, patch_idx, 0, 0] += local_gradx * local_gradx
+                hessian[patch_idy, patch_idx, 0, 1] += local_gradx * local_grady
+                hessian[patch_idy, patch_idx, 1, 0] += local_gradx * local_grady
+                hessian[patch_idy, patch_idx, 1, 1] += local_grady * local_grady
+
+    current_time, verbose_3 = time.perf_counter(), options["verbose"] >= 3
+    tile_size = kanade_params["tuning"]["tileSize"]
+    imsize_y, imsize_x = cuda_grady.shape
+    # image is padded during BM, we need to consider that to count patches
+    n_patch_y = math.ceil(imsize_y / tile_size)
+    n_patch_x = math.ceil(imsize_x / tile_size)
+
+    hessian = cuda.device_array((n_patch_y, n_patch_x, 2, 2), DEFAULT_NUMPY_FLOAT_TYPE)
+    hessian[:] = 0.0
+
+    threadsperblock = (DEFAULT_THREADS, DEFAULT_THREADS)
+
+    blockspergrid_y = math.ceil(n_patch_y / threadsperblock[0])
+    blockspergrid_x = math.ceil(n_patch_x / threadsperblock[1])
+    blockspergrid = (blockspergrid_y, blockspergrid_x)
+
+    compute_hessian[blockspergrid, threadsperblock](
+        cuda_grady, cuda_gradx, tile_size, hessian
+    )
+
+    if verbose_3:
+        cuda.synchronize()
+        current_time = getTime(current_time, " -- Hessian estimated")
+
+    return hessian
+
 
 def GAT(image, alpha, beta):
     """
@@ -572,7 +680,12 @@ def cupy_downsample(img, kernel="gaussian", factor=2):
     # Shape of the downsampled image
     h2, w2 = np.floor(np.array(filteredImage.shape[2:]) / float(factor)).astype(int)
 
-    return filteredImage[:, :, 2*factor : (h2-2) * factor : factor, 2*factor  : (w2-2) * factor : factor]
+    return filteredImage[
+        :,
+        :,
+        2 * factor : (h2 - 2) * factor : factor,
+        2 * factor : (w2 - 2) * factor : factor,
+    ]
 
 
 @cuda.jit(device=True)

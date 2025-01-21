@@ -17,10 +17,9 @@ from .linalg import bilinear_interpolation
 from .utils import (
     getTime,
     DEFAULT_CUDA_FLOAT_TYPE,
-    DEFAULT_NUMPY_FLOAT_TYPE,
     DEFAULT_THREADS,
 )
-from .utils_image import compute_gradient_torch
+from .utils_image import compute_gradient_cupy, compute_hessian_cupy
 from .linalg import solve_2x2
 
 
@@ -48,80 +47,18 @@ def init_ICA(ref_img, options, kanade_params):
         hessian matrix defined for each patch of the reference image.
 
     """
-    cuda_grady, cuda_gradx = compute_gradient_torch(
-        ref_img, options, kanade_params
+    cuda_grady, cuda_gradx = compute_gradient_cupy(ref_img, options, kanade_params)
+    hessian = compute_hessian_cupy(
+        cuda_grady, cuda_gradx, options, kanade_params
     )
 
     current_time, verbose_3 = time.perf_counter(), options["verbose"] >= 3
-    tile_size = kanade_params["tuning"]["tileSize"]
-    imsize_y, imsize_x = ref_img.shape
-    # image is padded during BM, we need to consider that to count patches
-    n_patch_y = math.ceil(imsize_y / tile_size)
-    n_patch_x = math.ceil(imsize_x / tile_size)
-
-    hessian = cuda.device_array((n_patch_y, n_patch_x, 2, 2), DEFAULT_NUMPY_FLOAT_TYPE)
-
-    threadsperblock = (DEFAULT_THREADS, DEFAULT_THREADS)
-
-    blockspergrid_x = math.ceil(n_patch_x / threadsperblock[1])
-    blockspergrid_y = math.ceil(n_patch_y / threadsperblock[0])
-    blockspergrid = (blockspergrid_x, blockspergrid_y)
-
-    compute_hessian[blockspergrid, threadsperblock](
-        cuda_gradx, cuda_grady, tile_size, hessian
-    )
 
     if verbose_3:
         cuda.synchronize()
         current_time = getTime(current_time, " -- Hessian estimated")
 
     return cuda_gradx, cuda_grady, hessian
-
-
-@cuda.jit
-def compute_hessian(gradx, grady, tile_size, hessian):
-    imshape = gradx.shape
-    patch_idx, patch_idy = cuda.grid(2)
-    n_patchy, n_patch_x, _, _ = hessian.shape
-
-    # discarding non existing patches
-    if not (patch_idy < n_patchy and patch_idx < n_patch_x):
-        return
-
-    patch_pos_idx = (
-        tile_size * patch_idx
-    )  # global position on the coarse grey grid. Because of extremity padding, it can be out of bound
-    patch_pos_idy = tile_size * patch_idy
-
-    local_hessian = cuda.local.array((2, 2), DEFAULT_CUDA_FLOAT_TYPE)
-    local_hessian[0, 0] = 0
-    local_hessian[0, 1] = 0
-    local_hessian[1, 0] = 0
-    local_hessian[1, 1] = 0
-
-    for i in range(tile_size):
-        for j in range(tile_size):
-            pixel_global_idy = patch_pos_idy + i
-            pixel_global_idx = patch_pos_idx + j
-
-            if not (
-                0 <= pixel_global_idy < imshape[0]
-                and 0 <= pixel_global_idx < imshape[1]
-            ):
-                continue
-
-            local_gradx = gradx[pixel_global_idy, pixel_global_idx]
-            local_grady = grady[pixel_global_idy, pixel_global_idx]
-
-            local_hessian[0, 0] += local_gradx * local_gradx
-            local_hessian[0, 1] += local_gradx * local_grady
-            local_hessian[1, 0] += local_gradx * local_grady
-            local_hessian[1, 1] += local_grady * local_grady
-
-    hessian[patch_idy, patch_idx, 0, 0] = local_hessian[0, 0]
-    hessian[patch_idy, patch_idx, 0, 1] = local_hessian[0, 1]
-    hessian[patch_idy, patch_idx, 1, 0] = local_hessian[1, 0]
-    hessian[patch_idy, patch_idx, 1, 1] = local_hessian[1, 1]
 
 
 def ICA_optical_flow(

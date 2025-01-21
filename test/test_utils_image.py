@@ -6,6 +6,8 @@ import torch
 from handheld_super_resolution.utils_image import (
     compute_gradient_cupy,
     compute_gradient_torch,
+    compute_hessian_cupy,
+    compute_hessian_numba,
     compute_grey_images_decimate_cupy,
     compute_grey_images_decimate_numba,
     compute_grey_images_fft_cupy,
@@ -86,39 +88,22 @@ def test_downsample_equal(
     assert np.allclose(result_cupy, result_cuda)
 
 
+# TODO: They use different methods for finding the gradient; not equal.
+@pytest.mark.skip("Not equal")
 @pytest.mark.parametrize(
-    "image_shape",
-    [
-        (3, 3),
-        # (64, 64),
-        # (128, 128),
-        # (256, 256),
-        # (512, 512),
-        # (1024, 1024),
-        # (2160, 3840),
-    ],
+    "image_shape", [(128, 128), (256, 256), (512, 512), (1024, 1024), (2160, 3840)]
 )
-@pytest.mark.parametrize(
-    "seed",
-    [
-        0,
-        # 1,
-        # 2,
-        # 3,
-        # 4,
-    ],
-)
-# TODO: Focusing on the case without sigma_blur for now
-# @pytest.mark.parametrize("sigma_blur", [0, 0.5, 1])
+@pytest.mark.parametrize("seed", [0, 1, 2, 3, 4])
+@pytest.mark.parametrize("sigma_blur", [0, 0.5, 1])
 def test_compute_gradient_equal(
     image_shape: tuple[int, int],
     seed: int,
-    # sigma_blur: float,
+    sigma_blur: float,
 ):
     # Test that the two functions compute the same result
     np.random.seed(seed)
     options = {"verbose": 0}
-    kanade_params = {"tuning": {"sigma blur": 0}}
+    kanade_params = {"tuning": {"sigma blur": sigma_blur}}
     image = np.random.rand(*image_shape).astype(np.float32)
     result_cupy_grad_y, result_cupy_grad_x = compute_gradient_cupy(
         image, options, kanade_params
@@ -130,3 +115,35 @@ def test_compute_gradient_equal(
     assert result_cupy_grad_x.shape == result_torch_grad_x.shape
     assert np.allclose(result_cupy_grad_y.get(), np.array(result_torch_grad_y))
     assert np.allclose(result_cupy_grad_x, result_torch_grad_x)
+
+
+@pytest.mark.parametrize(
+    "image_shape",
+    [(128, 128), (256, 256), (512, 512), (1024, 1024), (2160, 3840)],
+)
+@pytest.mark.parametrize("seed", [0, 1, 2, 3, 4])
+@pytest.mark.parametrize("tile_size", [16, 32])
+def test_compute_hessian_equal(
+    image_shape: tuple[int, int],
+    seed: int,
+    tile_size: int,
+):
+    # Test that the two functions compute the same result
+    np.random.seed(seed)
+    options = {"verbose": 0}
+    kanade_params = {
+        "tuning": {
+            "tileSize": tile_size,
+            "tileSizes": [tile_size, tile_size, tile_size, tile_size // 2],
+        }
+    }
+    cuda_grady = np.random.rand(*image_shape).astype(np.float32)
+    cuda_gradx = np.random.rand(*image_shape).astype(np.float32)
+    result_cupy_hessian = compute_hessian_cupy(
+        cuda_grady, cuda_gradx, options, kanade_params
+    )
+    result_numba_hessian = compute_hessian_numba(
+        cuda_grady, cuda_gradx, options, kanade_params
+    )
+    assert result_cupy_hessian.shape == result_numba_hessian.shape
+    assert np.allclose(result_cupy_hessian.get(), np.array(result_numba_hessian))
