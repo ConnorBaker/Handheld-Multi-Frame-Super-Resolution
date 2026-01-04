@@ -1,15 +1,12 @@
 import time
-import math
 
 import numpy as np
-from handheld_super_resolution.linalg import bilinear_interpolation
-from numba import cuda
 import torch
 import torch.nn.functional as F
 
 from .ICA import init_ica, align_lvl_ica
 from .block_matching import align_lvl_block_matching_L2, align_lvl_block_matching_L1
-from .utils import getTime, clamp, DEFAULT_NUMPY_FLOAT_TYPE, DEFAULT_CUDA_FLOAT_TYPE, DEFAULT_TORCH_FLOAT_TYPE, DEFAULT_THREADS
+from .utils import getTime, DEFAULT_TORCH_FLOAT_TYPE
 from .utils_image import cuda_downsample
 
 SOBEL_Y = torch.as_tensor(np.array([[-1], [0], [1]]), dtype=DEFAULT_TORCH_FLOAT_TYPE, device="cuda")[None, None]
@@ -81,20 +78,21 @@ def build_gaussian_pyramid(image, factors=[1, 2, 4, 4], kernel='gaussian'):
 
     return pyramid[::-1]
 
+@torch.compiler.disable
 def align(ref_pyramid, tyled_pyr, ref_tiled_fft, ref_gradx, ref_grady, ref_hessian,
           img, config):
 
-    th_img = torch.as_tensor(img, dtype=DEFAULT_TORCH_FLOAT_TYPE, device="cuda")[None, None]
+    # th_img = torch.as_tensor(img, dtype=DEFAULT_TORCH_FLOAT_TYPE, device="cuda")[None, None]
     
     currentTime, verbose = time.perf_counter(), config.verbose > 2
 
     # factors, tileSizes, distances, searchRadia and subpixels are described fine-to-coarse
     factors = config.block_matching.tuning.factors
 
-    moving_pyramid = build_gaussian_pyramid(th_img, factors)
+    moving_pyramid = build_gaussian_pyramid(img[None, None], factors)
 
     if verbose:
-        cuda.synchronize()
+        # cuda.synchronize()
         currentTime = getTime(currentTime, ' - Create moving pyramid')
 
     alignments = None
@@ -104,7 +102,7 @@ def align(ref_pyramid, tyled_pyr, ref_tiled_fft, ref_gradx, ref_grady, ref_hessi
         list_id = len(ref_pyramid) - l - 1
         # PyTorch uses per-thread default streams; Numba uses the CUDA default stream (presumably)
         # Without this barrier, PyTorch could read 'alignment' before the kernel writes finish.
-        cuda.synchronize()
+        # cuda.synchronize()
         if alignments is None:
             alignments = torch.zeros((*ref_tiled_fft_lvl.shape[:2], 2), dtype=DEFAULT_TORCH_FLOAT_TYPE, device="cuda")
         else:
@@ -116,7 +114,7 @@ def align(ref_pyramid, tyled_pyr, ref_tiled_fft, ref_gradx, ref_grady, ref_hessi
                 moving_lvl, alignments, l=list_id, config=config)
             
         if verbose:
-            cuda.synchronize()
+            # cuda.synchronize()
             currentTime = getTime(currentTime, ' - Align pyramid')
 
     return alignments
@@ -136,14 +134,14 @@ def align_lvl(ref_lvl, tyled_pyr_lvl, ref_fft_lvl, ref_gradx_lvl, ref_grady_lvl,
         raise ValueError("Unknown block matching metric {}".format(config.block_matching.metric))
 
     if verbose:
-        cuda.synchronize()
+        # cuda.synchronize()
         currentTime = getTime(currentTime, ' -- Block matching level {}'.format(l))
 
     align_lvl_ica(ref_lvl, ref_gradx_lvl, ref_grady_lvl, ref_hessian_lvl,
                   moving_lvl, alignments, l, config)
     
     if verbose:
-        cuda.synchronize()
+        # cuda.synchronize()
         currentTime = getTime(currentTime, ' -- ICA level {}'.format(l))
 
 

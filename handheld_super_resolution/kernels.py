@@ -72,7 +72,7 @@ def estimate_kernels(img, config):
     beta = config.noise_model.beta
 
     if verbose_3:
-        cuda.synchronize()
+        # cuda.synchronize()
         t1 = time.perf_counter()
     
     #__ Performing Variance Stabilization Transform
@@ -81,7 +81,8 @@ def estimate_kernels(img, config):
         
     #__ Decimate to grey
     if bayer_mode : 
-        img_grey = compute_grey_images_(img, method="decimating")
+        # TODO(@connorbaker): Why not FFT?
+        img_grey = compute_grey_images_(img, method="FFT")
     
     else :
         img_grey = img # no need to copy now, they will be copied to gpu later.
@@ -116,7 +117,7 @@ def estimate_kernels(img, config):
     cuda_full_grads = cuda.as_cuda_array(th_full_grad.squeeze().transpose(0,1).transpose(1, 2))
     # shape [y, x, 2]
     if verbose_3:
-        cuda.synchronize()
+        # cuda.synchronize()
         t1 = getTime(t1, "- Gradients computed")
         
     covs = cuda.device_array(grey_imshape + (2,2), DEFAULT_NUMPY_FLOAT_TYPE)
@@ -130,7 +131,7 @@ def estimate_kernels(img, config):
                                     k_detail, k_denoise, D_th, D_tr, k_stretch, k_shrink,
                                     covs, selection_law)  
     if verbose_3:
-        cuda.synchronize()
+        # cuda.synchronize()
         t1 = getTime(t1, "- Covariances estimated")
     
     return covs

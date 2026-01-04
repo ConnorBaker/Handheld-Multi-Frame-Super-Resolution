@@ -55,6 +55,27 @@ def apply_orientation(img, ori):
     
     return img
 
+# @torch.compile(mode="max-autotune", fullgraph=True)
+def compute_grey_images_fft(img):
+    imsize_y, imsize_x = img.shape
+
+    img = torch.fft.fft2(img) 
+    # th FFT induces copy on the fly : this is good because we dont want to 
+    # modify the raw image, it is needed in the future
+    # Note : the complex dtype of the fft2 is inherited from DEFAULT_TORCH_FLOAT_TYPE.
+    # Therefore, for DEFAULT_TORCH_FLOAT_TYPE = float32 we directly get complex64
+    img = torch.fft.fftshift(img)
+    
+    img[:imsize_y//4, :] = 0
+    img[:, :imsize_x//4] = 0
+    img[-imsize_y//4:, :] = 0
+    img[:, -imsize_x//4:] = 0
+    
+    img = torch.fft.ifftshift(img)
+    img = torch.fft.ifft2(img)
+
+    return img.real
+
 def compute_grey_images(img, method):
     """
     This function converts a raw image to a grey image, using the decimation or
@@ -78,27 +99,12 @@ def compute_grey_images(img, method):
         Corresponding grey scale image G
 
     """
-    imsize_y, imsize_x = img.shape
     if method == "FFT":
-        torch_img_grey = th.as_tensor(img, dtype=DEFAULT_TORCH_FLOAT_TYPE, device="cuda")
-        torch_img_grey = torch.fft.fft2(torch_img_grey) 
-        # th FFT induces copy on the fly : this is good because we dont want to 
-        # modify the raw image, it is needed in the future
-        # Note : the complex dtype of the fft2 is inherited from DEFAULT_TORCH_FLOAT_TYPE.
-        # Therefore, for DEFAULT_TORCH_FLOAT_TYPE = float32 we directly get complex64
-        torch_img_grey = torch.fft.fftshift(torch_img_grey)
-        
-        torch_img_grey[:imsize_y//4, :] = 0
-        torch_img_grey[:, :imsize_x//4] = 0
-        torch_img_grey[-imsize_y//4:, :] = 0
-        torch_img_grey[:, -imsize_x//4:] = 0
-        
-        torch_img_grey = torch.fft.ifftshift(torch_img_grey)
-        torch_img_grey = torch.fft.ifft2(torch_img_grey)
         # Here, .real() type inherits once again from the complex type.
         # numba type is read directly from the torch tensor, so everything goes fine.
-        return cuda.as_cuda_array(torch_img_grey.real)
+        return cuda.as_cuda_array(compute_grey_images_fft(th.as_tensor(img, dtype=DEFAULT_TORCH_FLOAT_TYPE, device="cuda")))
     elif method == "decimating":
+        imsize_y, imsize_x = img.shape
         grey_imshape_y, grey_imshape_x = grey_imshape = imsize_y//2, imsize_x//2
         
         img_grey = cuda.device_array(grey_imshape, DEFAULT_NUMPY_FLOAT_TYPE)

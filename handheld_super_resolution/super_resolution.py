@@ -14,13 +14,20 @@ This script contains :
 @author: jamyl
 """
 
+import json
 import os
+from statistics import mean
+import torch
+from torch import Tensor
+from jaxtyping import Float32
+from typing import Any
 import time
 import warnings
 
 from pathlib import Path
 import numpy as np
 from omegaconf import OmegaConf
+from numpy import typing as npt
 from numba import cuda
 import rawpy
 
@@ -35,8 +42,7 @@ from .kernels import estimate_kernels
 from .merge import merge, merge_ref
 from . import raw2rgb
 
-NOISE_MODEL_PATH = Path(os.path.dirname(__file__)).parent / 'data' 
-        
+NOISE_MODEL_PATH = Path(os.path.dirname(__file__)).parent / 'data'
 
 def main(ref_img, comp_imgs, config):
     """
@@ -94,7 +100,7 @@ def main(ref_img, comp_imgs, config):
     # This running buffer is for the image being processed
     stream = cuda.stream()
     cuda_img = cuda.device_array_like(comp_imgs[0], stream=stream)
-    cuda.synchronize()
+    # cuda.synchronize()
     cuda_std_curve = cuda.to_device(np.array(config.noise_model.std_curve))
     cuda_diff_curve = cuda.to_device(np.array(config.noise_model.diff_curve))
     
@@ -124,7 +130,7 @@ def main(ref_img, comp_imgs, config):
     den = cuda.to_device(np.zeros((*output_size, 3), dtype = DEFAULT_NUMPY_FLOAT_TYPE))
     
     if verbose :
-        cuda.synchronize()
+        # cuda.synchronize()
         getTime(t1, '\nRef Img processed (Total)')
 
 
@@ -132,7 +138,7 @@ def main(ref_img, comp_imgs, config):
     n_images = comp_imgs.shape[0]
     for im_id in range(n_images):
         if verbose :
-            cuda.synchronize()
+            # cuda.synchronize()
             print("\nProcessing image {} ---------\n".format(im_id+1))
             im_time = time.perf_counter()
         
@@ -165,7 +171,7 @@ def main(ref_img, comp_imgs, config):
         merge_(cuda_img, cuda_final_alignment, cuda_kernels, cuda_robustness, num, den, cfa_pattern, config)
         
         if verbose :
-            cuda.synchronize()
+            # cuda.synchronize()
             getTime(im_time, '\nImage processed (Total)')
             
         if debug_mode : 
@@ -200,29 +206,24 @@ def main(ref_img, comp_imgs, config):
     return num, debug_dict
 
 
-def process(burst_path, config):
-    """
-    Processes the burst
-
-    Parameters
-    ----------
-    burst_path : str or Path
-        Path of the folder where the .dng burst is located
-    config : OmegaConf object
-        parameters.
-
-    Returns
-    -------
-    Array
-        The processed image
-
-    """
+def setup(burst_path, config) -> tuple[
+    rawpy.RawPy, # raw
+    str, # raw_path
+    npt.NDArray[np.int8], # ref_raw
+    npt.NDArray[np.int8], # raw_comp
+    npt.NDArray[np.float32], # xyz2cam
+    dict[str, Any], # tags
+    OmegaConf, #config
+]:
     currentTime, verbose_1, verbose_2 = (time.perf_counter(),
                                          config.verbose >= 1,
                                          config.verbose >= 2)
     
     # reading image stack
-    ref_raw, raw_comp, ISO, tags, CFA, xyz2cam, white_balance, ref_path = load_dng_burst(burst_path)
+    raw, ref_raw, raw_comp, ISO, tags, CFA, xyz2cam, white_balance, ref_path = load_dng_burst(burst_path)
+
+    if verbose_2:   
+        currentTime = getTime(currentTime, ' -- Read raw files')
     
     if config.noise_model.get("alpha", None) is not None:
         # User provided custom values.
@@ -234,12 +235,25 @@ def process(burst_path, config):
         alpha = tags['Image Tag 0xC761'].values[0][0]
         beta = tags['Image Tag 0xC761'].values[1][0]
     else:
-        alpha = sum([x[0] for x in tags['Image Tag 0xC761'].values[::2]])/3
-        beta = sum([x[0] for x in tags['Image Tag 0xC761'].values[1::2]])/3
+        print("Using noise profiles for Sony a6300")
+        iso_to_values = {
+            entry["iso"]: {
+                "alpha": mean(entry["a"]),
+                "beta": mean(entry["b"])
+            }
+            for entry in json.loads((NOISE_MODEL_PATH / "sony-a6300.json").read_bytes())["profiles"]
+        }
+        alpha = iso_to_values[ISO]["alpha"]
+        beta = iso_to_values[ISO]["beta"]
+        # alpha = sum([x[0] for x in tags['Image Tag 0xC761'].values[::2]])/3
+        # beta = sum([x[0] for x in tags['Image Tag 0xC761'].values[1::2]])/3
     config.noise_model.update({
         "alpha": alpha,
         "beta": beta
         })
+    
+    if verbose_2:   
+        currentTime = getTime(currentTime, f' -- Using noise profile alpha {alpha} and beta {beta}')
     #### Packing noise model related to picture ISO
     # curve_iso = round_iso(ISO) # Rounds non standart ISO to regular ISO (100, 200, 400, ...)
     # std_noise_model_label = 'noise_model_std_ISO_{}'.format(curve_iso)
@@ -252,10 +266,9 @@ def process(burst_path, config):
     
     # Use this to compute noise curves on the fly
     std_curve, diff_curve = run_fast_MC(alpha, beta)
-    
-    
+
     if verbose_2:   
-        currentTime = getTime(currentTime, ' -- Read raw files')
+        currentTime = getTime(currentTime, ' -- Computed noise curves')
 
     #### Estimating ref image SNR
     brightness = np.mean(ref_raw)
@@ -295,7 +308,9 @@ def process(burst_path, config):
     else:
         config.accumulated_robustness_denoiser.enabled = False
     
-    
+    return raw, ref_path, ref_raw, raw_comp, xyz2cam, tags, config
+
+def run_pipeline(raw, ref_path, ref_raw, raw_comp, xyz2cam, tags, config):
     #### Running the handheld pipeline
     handheld_output, debug_dict = main(ref_raw.astype(DEFAULT_NUMPY_FLOAT_TYPE), raw_comp.astype(DEFAULT_NUMPY_FLOAT_TYPE), config)
     
@@ -310,37 +325,54 @@ def process(burst_path, config):
 
     post_processing_enabled = config.postprocessing.enabled
 
+    currentTime, verbose_1, verbose_2 = (time.perf_counter(),
+                                         config.verbose >= 1,
+                                         config.verbose >= 2)
+
     if post_frame_count_denoise or post_processing_enabled:
         if verbose_1:
-            print('Beginning post processing')
+            print('Post processing')
     
     if post_frame_count_denoise : 
         if verbose_2:
-            print('-- Robustness aware bluring')
+            print('- Robustness aware blurring')
         
         if median:
             handheld_output = frame_count_denoising_median(handheld_output, debug_dict['accumulated robustness'],
                                                            median_config)
+            if verbose_1 >= 3:
+                currentTime = getTime(currentTime, "-- Median denoising")
         if gauss:
             handheld_output = frame_count_denoising_gauss(handheld_output, debug_dict['accumulated robustness'],
                                                           gauss_config)
+            if verbose_1 >= 3:
+                currentTime = getTime(currentTime, "-- Gaussian denoising")
 
 
     #### post processing
     
     if post_processing_enabled:
         if verbose_2:
-            print('-- Post processing image')
-        
-        raw = rawpy.imread(ref_path)
-        output_image = raw2rgb.postprocess(raw, handheld_output.copy_to_host(),
+            print('- raw2rgb post-processing')
+
+        # output_image = raw2rgb.postprocess(raw, handheld_output.copy_to_host(),
+        #                                    config.postprocessing.do_color_correction,
+        #                                    config.postprocessing.do_tonemapping,
+        #                                    config.postprocessing.do_gamma_correction,
+        #                                    config.postprocessing.sharpening,
+        #                                    config.postprocessing.do_devignetting,
+        #                                    xyz2cam,
+        #                                    )
+        handheld_output = torch.as_tensor(handheld_output, device="cuda")
+        output_image = raw2rgb.postprocess(raw, handheld_output,
                                            config.postprocessing.do_color_correction,
                                            config.postprocessing.do_tonemapping,
                                            config.postprocessing.do_gamma_correction,
                                            config.postprocessing.sharpening,
                                            config.postprocessing.do_devignetting,
                                            xyz2cam,
-                                           ) 
+                                           )
+
     else:
         output_image = handheld_output.copy_to_host()
         
@@ -359,5 +391,24 @@ def process(burst_path, config):
     
     return output_image, debug_dict
 
-    
-    
+
+def process(burst_path, config) -> tuple[Float32[Tensor, "H W 3"], dict[str, Any]]:
+    """
+    Processes the burst
+
+    Parameters
+    ----------
+    burst_path : str or Path
+        Path of the folder where the .dng burst is located
+    config : OmegaConf object
+        parameters.
+
+    Returns
+    -------
+    Array
+        The processed image
+
+    """
+    raw, ref_path, ref_raw, raw_comp, xyz2cam, tags, config = setup(burst_path, config)
+    return run_pipeline(raw, ref_path, ref_raw, raw_comp, xyz2cam, tags, config)
+

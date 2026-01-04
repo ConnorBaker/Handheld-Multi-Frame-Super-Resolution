@@ -1,12 +1,19 @@
 import random
 import math
+import time
+from typing import Optional
 import warnings
+
+from jaxtyping import Float32
+from torch import Tensor
+import torch
+from torchvision.transforms.v2 import functional as F
 
 import exifread
 import numpy as np
 from skimage import img_as_float32, filters
 
-import cv2
+from handheld_super_resolution.utils import getTime
 
 def get_xyz2cam_from_exif(impath):
     # Open image file for reading (must be in binary mode)
@@ -130,19 +137,40 @@ def get_color_matrix(raw, xyz2cam=None):
     return rgb2cam.astype(np.float32)
 
 
-def apply_ccm(image, ccm):
-    assert(image.ndim == 3 and image.shape[-1] == 3)
-    image = np.transpose(image, (2, 0, 1))
-    shape = image.shape
-    image = image.reshape(3, -1)
-    image = np.matmul(ccm, image)
-    image = image.reshape(shape)
-    return np.transpose(image, (1, 2, 0))
+def get_cam2rgb(xyz2cam: Float32[Tensor, "3 3"]) -> Float32[Tensor, "3 3"]:
+    rgb2xyz = torch.as_tensor([[0.4124564, 0.3575761, 0.1804375],
+                        [0.2126729, 0.7151522, 0.0721750],
+                        [0.0193339, 0.1191920, 0.9503041]], device="cuda")
+
+    rgb2cam = xyz2cam @ rgb2xyz
+
+    # Normalizes each row.
+    rgb2cam = rgb2cam / rgb2cam.sum(axis=-1, keepdims=True)
+
+    cam2rgb = torch.linalg.inv(rgb2cam)
+    return cam2rgb
+
+def color_correction_torch(img: Float32[Tensor, "H W 3"], cam2rgb: Float32[Tensor, "3 3"]) -> Float32[Tensor, "H W 3"]:
+    # img = img @ torch.as_tensor(cam2rgb, device="cuda").T
+    # img = img.clip(0.0, 1.0)
+    # return img
+    return (img @ cam2rgb.T).clip(0.0, 1.0)
 
 
-def gamma_compression(img, gamma=2.2):
-    img = np.clip(img, a_min=0.0, a_max=1.0)
-    return img**(1./gamma)
+# def apply_ccm(image: Float32[Tensor, "H W 3"], ccm: Float32[Tensor, "3 3"]) -> Float32[Tensor, "H W 3"]:
+#     assert(image.ndim == 3 and image.shape[-1] == 3)
+#     assert(ccm.shape == (3, 3))
+#     return image @ ccm.T
+    # image = np.transpose(image, (2, 0, 1))
+    # shape = image.shape
+    # image = image.reshape(3, -1)
+    # image = np.matmul(ccm, image)
+    # image = image.reshape(shape)
+    # return np.transpose(image, (1, 2, 0))
+
+
+def gamma_compression(img: Float32[Tensor, "H W 3"], gamma:float =2.2) -> Float32[Tensor, "H W 3"]:
+    return F.adjust_gamma(img.clip(0.0, 1.0) , 1.0/gamma)
 
 
 def gamma_expansion(img, gamma=2.2):
@@ -150,30 +178,16 @@ def gamma_expansion(img, gamma=2.2):
     return img ** gamma
 
 
-def apply_smoothstep(image):
-    """Apply global tone mapping curve."""
-    # image_out = 3 * image**2 - 2 * image**3
-    
-    # tonemap = cv2.createTonemap(1.0)
-    # image_out = tonemap.process(image)
-    
-    from skimage import img_as_ubyte, img_as_float32
-    times = [1, 0.5, 2]
-    images = [img_as_ubyte(np.clip(image*i, 0, 1)) for i in times] 
-    
-    
-    merge_mertens = cv2.createMergeMertens()
-    image_out = merge_mertens.process(images)
-    image_out = img_as_float32(image_out)
-
-    image_out = 3 * image_out**2 - 2 * image_out**3
-    return image_out
+def apply_smoothstep(image: Float32[Tensor, "H W C"]) -> Float32[Tensor, "H W C"]:
+    """Apply global tone mapping curve using smoothstep formula: 3x² - 2x³."""
+    image = image.clip(0.0, 1.0)
+    return 3 * image**2 - 2 * image**3
 
 
-def invert_smoothstep(image):
+def invert_smoothstep(image: Float32[Tensor, "H W C"]) -> Float32[Tensor, "H W C"]:
     """Approximately inverts a global tone mapping curve."""
-    image = np.clip(image, a_min=0.0, a_max=1.0)
-    return 0.5 - np.sin(np.arcsin(1.0 - 2.0 * image) / 3.0)
+    image = image.clip(0.0, 1.0)
+    return 0.5 - torch.sin(torch.arcsin(1.0 - 2.0 * image) / 3.0)
 
 
 def unprocess_isp(jpg, log_max_shot=0.012):
@@ -209,8 +223,8 @@ def devignette(image):
     image_out = (2 - np.cos(vignette_filter)**4)[:,:,None] * image 
     return image_out
 
-def postprocess(raw, img=None, do_color_correction=True, do_tonemapping=True, 
-                do_gamma=True, sharpening_config=None, do_devignette=False, xyz2cam=None):
+def postprocess(raw, img: Optional[Float32[Tensor, "H W 3"]] =None, do_color_correction=True, do_tonemapping=True, 
+                do_gamma=True, sharpening_config=None, do_devignette=False, xyz2cam=None, cam2rgb=None) -> Float32[Tensor, "H W 3"]:
     """
     Convert a raw image to jpg image.
     """
@@ -218,13 +232,19 @@ def postprocess(raw, img=None, do_color_correction=True, do_tonemapping=True,
         ## Rawpy processing - whole stack
         return img_as_float32(raw.postprocess(use_camera_wb=True))
     else:
+        currentTime = time.perf_counter()
         ## Color matrix
         if do_color_correction:
+            assert cam2rgb is not None
+
+            # TODO: remove passing xyz2cam; use cam2rgb instead!
             ## First, read the color matrix from rawpy
-            rgb2cam = get_color_matrix(raw, xyz2cam)
-            cam2rgb = np.linalg.inv(rgb2cam)
-            img = apply_ccm(img, cam2rgb)
-            img = np.clip(img, 0.0, 1.0)
+            # rgb2cam = get_color_matrix(raw, xyz2cam)
+            # cam2rgb = np.linalg.inv(rgb2cam)
+            # img @= torch.as_tensor(cam2rgb, device=img.device).T
+            # img = img.clip(0.0, 1.0)
+            img = (img @ cam2rgb.T).clip(0.0, 1.0)
+
         ## Sharpening
         if sharpening_config is not None and sharpening_config.enabled:
             if "radius" in sharpening_config and "amount" in sharpening_config:
@@ -236,15 +256,15 @@ def postprocess(raw, img=None, do_color_correction=True, do_tonemapping=True,
                 img = filters.unsharp_mask(img, radius=3,
                                            amount=0.5,
                                            channel_axis=2, preserve_range=True)
+                
+            currentTime = getTime(currentTime, "-- Sharpening")
         ## Devignette
         if do_devignette:
             img = devignette(img)
-        ## Tone mapping
-        if do_tonemapping:
-            img = apply_smoothstep(img)
-        img = np.clip(img, 0.0, 1.0)
         ## Gamma compression
         if do_gamma:
-            img = gamma_compression(img)
-        img = np.clip(img, 0.0, 1.0)
+            img = gamma_compression(img).clip(0.0, 1.0)
+        ## Tone mapping
+        if do_tonemapping:
+            img = apply_smoothstep(img).clip(0.0, 1.0)
         return img

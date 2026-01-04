@@ -127,14 +127,14 @@ def round_iso(iso):
 
 def timer(func, enabled, start_s=None, end_s=None, spaceSize=50):
     def wrapper(*args, **kwargs):
-        cuda.synchronize()
+        # cuda.synchronize()
         t1 = time.perf_counter()
         if start_s is not None:
             print(start_s)
         
         out = func(*args, **kwargs)
         
-        cuda.synchronize()
+        # cuda.synchronize()
 
         if end_s is not None:
             print(end_s, ' ' * (spaceSize - len(end_s)), ': ', round((time.perf_counter() - t1) * 1000, 2), 'milliseconds')

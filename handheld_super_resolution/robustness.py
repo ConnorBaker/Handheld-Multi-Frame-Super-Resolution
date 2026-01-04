@@ -16,11 +16,13 @@ import math
 
 import numpy as np
 from numba import cuda, uint8
+from numba.cuda.cudadrv.devicearray import DeviceNDArray
+from omegaconf import OmegaConf
 
 from .utils import getTime, DEFAULT_CUDA_FLOAT_TYPE,DEFAULT_NUMPY_FLOAT_TYPE, DEFAULT_THREADS, clamp, timer
 from .utils_image import dogson_biquadratic_kernel, dogson_quadratic_kernel
 
-def init_robustness(ref_img, cfa_pattern, white_balance, config):
+def init_robustness(ref_img: DeviceNDArray, cfa_pattern: DeviceNDArray, white_balance: DeviceNDArray, config: OmegaConf) -> tuple[DeviceNDArray, DeviceNDArray]:
     """
     Initialiazes the robustness etimation procedure by
     computing the local stats of the reference image

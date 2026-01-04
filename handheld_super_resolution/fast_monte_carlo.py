@@ -11,6 +11,7 @@ the curve. Linear parts are interpolated, resulting in a considerable time gain.
 """
 
 import numpy as np
+from numpy import typing as npt
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import multiprocessing
@@ -154,7 +155,7 @@ def interp_MC(b_array,
     return np.sqrt(sigmas_sq_lin[1:-1]), np.sqrt(diffs_sq_lin[1:-1])
 
 
-def run_fast_MC(alpha, beta):
+def run_fast_MC(alpha: float, beta: float) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
     """
     Computes diff and sigmas for 1001 values of brighntess, for fixed alpha and
     beta.

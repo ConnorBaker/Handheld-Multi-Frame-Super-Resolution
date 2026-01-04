@@ -6,15 +6,18 @@ Created on Tue Mar 21 16:44:36 2023
 """
 
 import os
-import glob
 import subprocess
 
 import numpy as np
+import numpy.typing as npt
 from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing
 import exifread
 import rawpy
 import imageio
 import warnings
+from typing import Any
 
 from . import raw2rgb
 from .utils import DEFAULT_NUMPY_FLOAT_TYPE
@@ -47,7 +50,54 @@ PHOTO_INTER = {
 # Supported Photometric Interpretations
 SUPPORTED = [1, 32803]
 
-def load_dng_burst(burst_path):
+def read_raw_file(raw_path: str) -> npt.NDArray[np.int8]:
+    """Helper function to read a single raw file."""
+    with rawpy.imread(raw_path) as rawObject:
+        # return rawObject.raw_image.copy()
+        return rawObject.raw_image_visible.copy()
+    
+def load_dng_burst_parallel(burst_path: str) -> tuple[str, rawpy.RawPy, npt.NDArray[np.int8], npt.NDArray[np.int8]]:
+    """
+    Parallel version of load_dng_burst using multiprocessing.
+    
+    Parameters
+    ----------
+    burst_path : Path or str
+        Path of the folder containing the .dngs/.ARW files
+    """
+    
+    raw_path_list = [str(p) for p in Path(burst_path).glob('*.ARW')]
+    assert len(raw_path_list) != 0, 'At least one raw .ARW file must be present in the burst folder.'
+    
+    ref_id = 0
+    raw_comp = []
+    
+    # Read companion images in parallel
+    with ProcessPoolExecutor(mp_context=multiprocessing.get_context("fork")) as pool:
+        for idx, thing in enumerate(pool.map(read_raw_file, raw_path_list[1:])):
+            raw_comp.append(thing)
+
+    raw_comp = np.array(raw_comp)
+    
+    # Reference image (still read separately for metadata extraction)
+    raw_path = raw_path_list[ref_id]
+    raw = rawpy.imread(raw_path)
+    # ref_raw = raw.raw_image.copy()
+    ref_raw = raw.raw_image_visible.copy()
+
+    return raw_path, raw, ref_raw, raw_comp
+
+def load_dng_burst(burst_path) -> tuple[
+    rawpy.RawPy,
+    npt.NDArray[np.int8], # ref_raw
+    npt.NDArray[np.int8], # raw_comp
+    int, # ISO
+    dict[str, Any], # tags
+    npt.NDArray[np.int8], # CFA
+    npt.NDArray[np.float32], # xyz2cam
+    npt.NDArray[np.float32], # white_balance
+    str, # raw_path
+]:
     """
     Loads a dng burst into numpy arrays, and their exif tags.
 
@@ -74,37 +124,14 @@ def load_dng_burst(burst_path):
         Path of the reference image.
 
     """
-    ref_id = 0
-    raw_comp = []
-
-    # This ensures that burst_path is a Path object
-    burst_path = Path(burst_path)
-
-
-    #### Read dng as numpy arrays
-    # Get the list of raw images in the burst path
-    raw_path_list = glob.glob(os.path.join(burst_path.as_posix(), '*.dng'))
-    assert len(raw_path_list) != 0, 'At least one raw .dng file must be present in the burst folder.'
-    # Read the raw bayer data from the DNG files
-    for index, raw_path in enumerate(raw_path_list):
-        with rawpy.imread(raw_path) as rawObject:
-            if index != ref_id:
-
-                raw_comp.append(rawObject.raw_image.copy())  # copy otherwise image data is lost when the rawpy object is closed
-    raw_comp = np.array(raw_comp)
-
-    # Reference image selection and metadata
-    raw = rawpy.imread(raw_path_list[ref_id])
-    ref_raw = raw.raw_image.copy()
-
-
-
+    raw_path, raw, ref_raw, raw_comp = load_dng_burst_parallel(burst_path)
 
     #### Reading tags of the reference image
-    xyz2cam = raw2rgb.get_xyz2cam_from_exif(raw_path_list[ref_id])
+    # xyz2cam = raw2rgb.get_xyz2cam_from_exif(raw_path_list[ref_id])
+    xyz2cam = np.array(raw.rgb_xyz_matrix[:3])
 
     # reading exifs for white level, black leve and CFA
-    with open(raw_path_list[ref_id], 'rb') as raw_file:
+    with open(raw_path, 'rb') as raw_file:
         tags = exifread.process_file(raw_file)
 
 
@@ -126,7 +153,7 @@ def load_dng_burst(burst_path):
 
     black_levels = raw.black_level_per_channel
 
-    white_balance = raw.camera_whitebalance
+    white_balance = np.array(raw.camera_whitebalance)
 
     CFA = raw.raw_pattern.copy() # copying to ensure contiguity of the array
     CFA[CFA == 3] = 1 # Rawpy gives channel 3 to the second green channel. Setting both greens to 1
@@ -161,7 +188,7 @@ def load_dng_burst(burst_path):
     else:
         warnings.warn('Input DNG images are not in integer format: is the input valid RAW data?')
 
-    return ref_raw, raw_comp, ISO, tags, CFA, xyz2cam, white_balance, raw_path_list[ref_id]
+    return raw, ref_raw, raw_comp, ISO, tags, CFA, xyz2cam, white_balance, raw_path
 
 
 def save_as_dng(np_img, ref_dng_path, outpath):

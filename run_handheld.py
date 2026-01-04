@@ -8,17 +8,21 @@ Created on Thu Feb 23 13:51:42 2023
 import os
 import glob
 
+import time
 import argparse
 from pathlib import Path
 from omegaconf import OmegaConf
 import numpy as np
 import torch
 from skimage import img_as_float32, img_as_ubyte, io, color, filters
+from torchvision import io
+from torchvision.transforms.v2 import functional as F
 import cv2
 import rawpy
 
-from handheld_super_resolution import process
+from handheld_super_resolution.super_resolution_object import SRObject
 from handheld_super_resolution.utils_dng import save_as_dng 
+from handheld_super_resolution.utils import getTime
 
 def print_parameters(config):
     print('\nParameters:\n')
@@ -66,7 +70,7 @@ def print_parameters(config):
 
     print()
 
-if __name__ == "__main__":
+def main():
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     
     #### Argparser
@@ -129,17 +133,20 @@ if __name__ == "__main__":
         config.postprocessing.enabled = False
 
 
-    handheld_output, debug_dict = process(args.impath, config)
-    handheld_output = np.nan_to_num(handheld_output)
-    handheld_output = np.clip(handheld_output, 0, 1)
-    
-    
-    # define a faster imsave for large png images
-    def imsave(fname, rgb_8bit_data):
-        return cv2.imwrite(fname,  cv2.cvtColor(rgb_8bit_data, cv2.COLOR_RGB2BGR ))
-    
-    
+    sr_object = SRObject(args.impath, config)
+    handheld_output, debug_dict = sr_object.run()
+
+
+    # handheld_output, debug_dict = process(args.impath, config)
+    handheld_output = handheld_output.nan_to_num()
+    handheld_output = handheld_output.clip(0.0, 1.0)
+    print("handheld_output.dtype", handheld_output.dtype)
+    print("handheld_output.shape", handheld_output.shape)
+
     #### Save images ####
+    if config.verbose >= 3:
+        print("\nSaving images ---------\n")
+        t1 = time.perf_counter()
     
     if outpath.suffix == '.dng':
         if config.verbose >=1 :
@@ -148,12 +155,31 @@ if __name__ == "__main__":
         save_as_dng(handheld_output, ref_img_path, outpath)
         
     else:
-        imsave(args.outpath, img_as_ubyte(handheld_output))
+        # Exepcted tensor should have channels first
+        # NOTE: NVJPEG won't work with images as large as we're processing, so move to CPU first.
+        handheld_output = F.crop(F.to_dtype(handheld_output, dtype=torch.uint8, scale=True).permute([2,0,1]).cpu(), 24, 24, 8000, 12000)
+        io.write_jpeg(handheld_output, args.outpath)
+        # imsave(args.outpath, img_as_ubyte(handheld_output))
+
+    if config.verbose >= 3:
+        t1 = getTime(t1, "- Super-resolved image saved")
 
     if config.robustness.save_mask and debug_dict.get('accumulated robustness', None) is not None:
-        n_images = len(glob.glob(os.path.join(args.impath, '*.dng')))
-        rob = debug_dict['accumulated robustness'].copy_to_host()/(n_images-1)
-        rob = np.repeat(rob[..., None], 3, axis=-1)
+        n_images = len(glob.glob(os.path.join(args.impath, '*.ARW')))
+        rob = torch.tensor(debug_dict['accumulated robustness'], device=device)/(n_images-1)
+        # rob = np.repeat(rob[..., None], 3, axis=-1)
         # Upscale NN to output scale
-        rob = cv2.resize(rob, (handheld_output.shape[1], handheld_output.shape[0]), interpolation=cv2.INTER_NEAREST)
-        imsave(Path(args.outpath).with_suffix('.rob.png'), img_as_ubyte(rob))
+        # handheld_output is now CHW
+        # Make sure rob is 1HW
+        # rob = F.resize(rob[None, ...], [handheld_output.shape[1], handheld_output.shape[2]])
+        rob = F.to_dtype(rob[None, ...], dtype=torch.uint8, scale=True).cpu()
+        io.write_jpeg(rob, str(Path(args.outpath).with_suffix('.rob.jpg')))
+        # rob = cv2.resize(rob, (handheld_output.shape[1], handheld_output.shape[0]), interpolation=cv2.INTER_NEAREST)
+        # imsave(Path(args.outpath).with_suffix('.rob.jpg'), img_as_ubyte(rob))
+
+
+    if config.verbose >= 3:
+        t1 = getTime(t1, "- Accumulated robustness saved")
+
+if __name__ == "__main__":
+    main()

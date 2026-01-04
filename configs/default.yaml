@@ -1,10 +1,10 @@
-scale: 1
+scale: 2
 mode: bayer
 debug: false
-verbose: 1
+verbose: 0
 grey_method: FFT
 noise_model:
-  alpha: 
+  alpha:
   beta:
 
 block_matching:
@@ -15,7 +15,7 @@ block_matching:
     tile_size_factors: [1, 1, 1, 0.5]
     search_radii: [1, 4, 4, 4]
     metrics: ['L1', 'L2', 'L2', 'L2']
-    flow_upscale_mode: nearest  # options: nearest, bilinear, bicubic
+
 ica:
   tuning:
     n_iter: 3
@@ -43,26 +43,26 @@ merging:
 
 postprocessing:
   enabled: true
-  do_color_correction: False
+  do_color_correction: true
   do_gamma_correction: true
   do_tonemapping: false
   sharpening:
-    enabled: true
+    enabled: false
     amount: 1.5
     radius: 3
   do_devignetting: false
 
 accumulated_robustness_denoiser: 
   median:
-    enabled: False
+    enabled: false
     radius_max: 3
     max_frame_count: 8
   gauss:
-    enabled: False
+    enabled: false
     sigma_max: 1.5
     max_frame_count: 8
   merge:
-    enabled: False
+    enabled: true
     rad_max: 2
     max_multiplier: 8 # Multiplier of the covariance for single frame SR
-    max_frame_count: 2 # # number of merged frames above which no blur is applied
+    max_frame_count: 2 # number of merged frames above which no blur is applied
