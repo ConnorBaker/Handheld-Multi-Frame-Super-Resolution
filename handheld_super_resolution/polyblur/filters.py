@@ -1,5 +1,4 @@
 import torch
-import torch.nn.functional as F
 import numpy as np
 import torch.fft
 
@@ -10,42 +9,18 @@ from . import utils
 ######################## Convolution 2D #############################
 #####################################################################
 
-def convolve2d(img, kernel, ksize=25, padding='same', method='direct'):
-    """
-    A per kernel wrapper for torch.nn.functional.conv2d
-    :param img: (B,C,H,W) torch.tensor, the input images
-    :param kernel: (B,C,h,w) or 
-                   (B,1,h,w) torch.tensor, the 2d blur kernels (valid for both deblurring methods), or 
-                   [(B,C), (B,C), (B,C)] or 
-                   [(B,1), (B,1), (B,1)], the separable 1d blur kernel parameters (valid only for spatial deblurring)
-    :param padding: string, can be 'valid' or 'same' 
-    : 
-    :return imout: (B,C,H,W) torch.tensor, the filtered images
-    """
-    if method == 'direct':
-        return conv2d_(img, kernel, padding)
-    elif method == 'fft':
-        assert isinstance(kernel, torch.Tensor)  # for FFT, we only use 2D kernels
-        X = torch.fft.fft2(utils.pad_with_kernel(img, kernel, mode='circular'))
-        K = p2o(kernel, X.shape[-2:])
-        return utils.crop_with_kernel( torch.real(torch.fft.ifft2(K * X)), kernel )
-    else:
-        raise('Convolution method %s is not implemented' % method)
+def convolve2d(img, kernel):
+    """FFT convolution of (B,C,H,W) images by a (B,C,h,w)/(B,1,h,w) 2D kernel.
 
-
-def conv2d_(img, kernel, padding='same'):
+    Circular-pads by the kernel half-width, multiplies by the kernel's OTF in the
+    Fourier domain, then crops back. (Upstream also had a spatial 'direct' path
+    via F.conv2d selected by a `method` arg; the deblur pipeline only ever uses
+    this FFT path, so the direct path was removed.)
     """
-    Wrapper for F.conv2d with possibly multi-channels kernels.
-    """
-    # if the number of kernel matches the number of 
-    if kernel.shape[1] == img.shape[1]:  # check how many color channels in the kernel
-        return F.conv2d(img, kernel, groups=kernel.shape[1], padding=padding)
-    else:
-        img = [F.conv2d(img[:,c:c+1], kernel, padding=padding) for c in range(img.shape[1])]
-        return torch.cat(img, dim=1)
+    X = torch.fft.fft2(utils.pad_with_kernel(img, kernel, mode='circular'))
+    K = p2o(kernel, X.shape[-2:])
+    return utils.crop_with_kernel(torch.real(torch.fft.ifft2(K * X)), kernel)
 
-
-    
 
 
 #####################################################################
@@ -133,65 +108,6 @@ def fourier_gradients(images):
     gyu = torch.real(torch.fft.ifft2(gyU))
     # gyu = crop(gyu, (h, w))
     return gxu, gyu
-
-
-def crop(image, new_size):
-    size = image.shape[-2:]
-    if size[0] - new_size[0] > 0:
-        image = image[..., :new_size[0], :]
-    if size[1] - new_size[1] > 0:
-        image = image[..., :new_size[1]]
-    return image
-
-
-def gaussian_filter(sigma, theta, shift=np.array([0.0, 0.0]), k_size=np.array([15, 15])):
-    """"
-    Returns a generalized 2D gaussian filter with eigenvalues sigma and angle theta
-    # modified version of https://github.com/assafshocher/BlindSR_dataset_generator
-    # Kai Zhang
-    """
-    # Set random eigen-vals (lambdas) and angle (theta) for COV matrix
-    lambda_1, lambda_2 = sigma
-    theta = -theta
-
-    # Set COV matrix using Lambdas and Theta
-    LAMBDA = np.diag([lambda_1**2, lambda_2**2])
-    Q = np.array([[np.cos(theta), -np.sin(theta)],
-                  [np.sin(theta), np.cos(theta)]])
-    SIGMA = Q @ LAMBDA @ Q.T
-    INV_SIGMA = np.linalg.inv(SIGMA)[None, None, :, :]
-
-    # Set expectation position
-    MU = k_size // 2 - shift
-    MU = MU[None, None, :, None]
-
-    # Create meshgrid for Gaussian
-    [X, Y] = np.meshgrid(range(k_size[0]), range(k_size[1]))
-    Z = np.stack([X, Y], 2)[:, :, :, None]
-
-    # Calculate Gaussian for every pixel of the kernel
-    ZZ = Z-MU
-    ZZ_t = ZZ.transpose(0, 1, 3, 2)
-    raw_kernel = np.exp(-0.5 * np.squeeze(ZZ_t @ INV_SIGMA @ ZZ)).astype(np.float32)
-
-    # Normalize the kernel and return
-    if np.sum(raw_kernel) < 1e-2:
-        kernel = np.zeros_like(raw_kernel)
-        kernel[k_size[0]//2, k_size[1]//2] = 1
-    else:
-        kernel = raw_kernel / np.sum(raw_kernel)
-    return kernel
-
-
-def dirac(dims):
-    """
-    Returns a kernel of size dims with a centered dirac
-    """
-    kernel = np.zeros(dims)
-    hh = dims[0] // 2
-    hw = dims[1] // 2
-    kernel[hh, hw] = 1
-    return kernel
 
 
 #####################################################################

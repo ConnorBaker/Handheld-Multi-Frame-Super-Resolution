@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .import utils
-from .filters import gaussian_filter, fourier_gradients
+from .filters import fourier_gradients
 
 
 ##############################################

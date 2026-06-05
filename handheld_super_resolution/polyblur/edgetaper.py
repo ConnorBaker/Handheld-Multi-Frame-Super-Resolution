@@ -22,12 +22,11 @@ def edgetaper_alpha(kernel, img_shape):
     return v1.unsqueeze(-1) * v2.unsqueeze(-2)
 
 
-def edgetaper(img, kernel, n_tapers=3, method='fft'):
+def edgetaper(img, kernel, n_tapers=3):
     h, w = img.shape[-2:]
     alpha = edgetaper_alpha(kernel, (h, w))
-    _kernel = kernel
     for i in range(n_tapers):
-        blurred = convolve2d(img, kernel, method=method)
+        blurred = convolve2d(img, kernel)
         img = alpha * img + (1.0 - alpha) * blurred
     return img
 

@@ -32,3 +32,22 @@ aberration stages:
   squeezed `value_min`/`value_max` to 2D, so the `(b,c,1,1)` broadcast against the
   `(b,c,h,w)` image collapsed across channels; restored the trailing singleton
   dims (`# vendored-fix`).
+
+Second pass (every live caller passes `method="fft"` and `q=0.0`, so the entire
+spatial `method="direct"` / `direct_separable` machinery is unreachable; −271 net
+lines, again bit-identical):
+
+- `deblurring.py` — deleted the `PolyblurDeblurring` `nn.Module` (we call the
+  functional `polyblur_deblurring` directly; the class's `patch_decomposition`
+  branch even `NameError`ed on an undefined `handling_saturation`, proving it was
+  never run) and the `compute_polynomial` dispatcher + `compute_polynomial_direct`;
+  `inverse_filtering_rank3` now calls `compute_polynomial_fft` directly and the
+  dead `method`/`nn`/`F` plumbing is gone.
+- `filters.py` — `convolve2d` is now FFT-only (dropped the `method='direct'`
+  branch and its `conv2d_` helper); removed the unused `crop`, `dirac`, and the
+  numpy `gaussian_filter` (superseded by the torch `create_gaussian_filter` in
+  `blur_estimation.py`, which imported but never called it).
+- `edgetaper.py` — `edgetaper` lost its now-redundant `method` arg and a dead
+  `_kernel` local.
+
+The public `polyblur_deblurring(..., method='fft')` signature is unchanged.
