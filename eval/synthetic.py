@@ -20,12 +20,61 @@ from . import pipeline_runner as pr
 _CFA = {"GRBG": np.array([[1, 0], [2, 1]]), "RGGB": np.array([[0, 1], [1, 2]])}
 
 
+def apply_optics(img, psf_sigma=0.0, psf_sigma_corner=None, ca_px=0.0):
+    """Inject a KNOWN optical degradation into a full-res frame, BEFORE the sensor
+    samples it -- a (optionally field-varying) Gaussian PSF blur + radial lateral
+    chromatic aberration. This is what was missing from the forward model: it gives
+    the deblur a real blur to invert and the defringer real fringing to remove, so
+    a comparison to the *clean* GT can actually reward (or punish) their correction.
+
+    Applied AFTER the scene shift, i.e. fixed in sensor/frame coordinates, exactly
+    like a real lens. Defaults are no-ops (backward compatible).
+
+    psf_sigma         : Gaussian blur std (px, at this full-res scale) at the centre.
+    psf_sigma_corner  : blur std at the corner; if set != psf_sigma, the blur grows
+                        radially (a crude field-varying PSF -- the case the per-tile
+                        aberration deblur is meant to beat a global deblur on).
+    ca_px             : lateral-CA channel shift (px) at the image corner. R is
+                        magnified outward by this, B inward (opposite radial shift),
+                        G left alone -- the radial R/B split real lenses produce.
+    """
+    H, W = img.shape[:2]
+    out = img.astype(np.float32)
+    if psf_sigma and psf_sigma > 0:
+        cc = psf_sigma if psf_sigma_corner is None else psf_sigma_corner
+        if abs(cc - psf_sigma) < 1e-6:
+            out = cv2.GaussianBlur(out, (0, 0), psf_sigma)
+        else:  # blend a centre-sigma and corner-sigma blur by normalized radius
+            yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+            r = np.hypot(yy - (H - 1) / 2, xx - (W - 1) / 2)
+            r = (r / r.max())[..., None]
+            out = cv2.GaussianBlur(out, (0, 0), psf_sigma) * (1 - r) + \
+                  cv2.GaussianBlur(out, (0, 0), cc) * r
+    if ca_px and ca_px > 0:
+        out = np.ascontiguousarray(out)
+        rmax = np.hypot((H - 1) / 2, (W - 1) / 2)
+        m = ca_px / rmax  # per-unit-radius magnification so the corner shift = ca_px
+        for ch, sgn in ((0, +1.0), (2, -1.0)):  # R out, B in
+            s = 1.0 + sgn * m
+            Mc = np.float32([[s, 0, (1 - s) * (W - 1) / 2],
+                             [0, s, (1 - s) * (H - 1) / 2]])
+            out[..., ch] = cv2.warpAffine(out[..., ch], Mc, (W, H),
+                                          flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
+    return np.clip(out, 0, 1).astype(np.float32)
+
+
 def make_synthetic_burst(gt, n=8, factor=2, max_shift=2.0, alpha=1e-4, beta=0.0,
-                         seed=0, cfa_str="GRBG"):
+                         seed=0, cfa_str="GRBG", psf_sigma=0.0, psf_sigma_corner=None, ca_px=0.0):
     """Build a (burst dict, gt) usable by pipeline_runner.run at scale=factor.
 
     gt: float32 RGB in [0,1], H2xW2 (multiple of 2*factor recommended).
     Frame 0 is the (unshifted) reference; the rest get known sub-pixel shifts.
+
+    psf_sigma / psf_sigma_corner / ca_px (all default to no-op) inject a known
+    optical PSF + lateral CA per frame before downsampling -- see ``apply_optics``.
+    The returned ``gt`` stays the CLEAN image, so recovering it rewards deblur +
+    defringe; with all three at 0 the forward model is the original (shift +
+    anti-aliased downsample + mosaic + noise).
     """
     rng = np.random.default_rng(seed)
     H2, W2, _ = gt.shape
@@ -36,6 +85,7 @@ def make_synthetic_burst(gt, n=8, factor=2, max_shift=2.0, alpha=1e-4, beta=0.0,
         dy, dx = (0.0, 0.0) if i == 0 else tuple(rng.uniform(-max_shift, max_shift, 2))
         M = np.float32([[1, 0, dx * factor], [0, 1, dy * factor]])
         sh = cv2.warpAffine(gt, M, (W2, H2), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
+        sh = apply_optics(sh, psf_sigma, psf_sigma_corner, ca_px)  # lens PSF + lateral CA (sensor coords)
         lr = cv2.resize(sh, (W, H), interpolation=cv2.INTER_AREA)
         bayer = np.zeros((H, W), np.float32)
         for ii in range(2):

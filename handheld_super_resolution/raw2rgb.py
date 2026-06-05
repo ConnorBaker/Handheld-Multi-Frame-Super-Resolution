@@ -226,6 +226,8 @@ def _deblur(img, deblur_config):
     out = polyblur_deblurring(
         t,
         n_iter=int(deblur_config.get("n_iter", 1)),
+        c=float(deblur_config.get("c", 0.352)),       # blur-model slope
+        b=float(deblur_config.get("sigma_b", 0.768)),  # blur-model intercept (higher => less blur estimated)
         alpha=float(deblur_config.get("alpha", 2)),
         beta=float(deblur_config.get("beta", 3)),
         remove_halo=bool(deblur_config.get("remove_halo", True)),

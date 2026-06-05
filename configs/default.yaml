@@ -52,6 +52,8 @@ postprocessing:
   deblur:                 # Polyblur blind deblur (vendored); ON by default, replaces sharpening
     enabled: true
     n_iter: 1
+    c: 0.352             # blur-model slope   (sigma^2 = c^2/grad^2 - sigma_b^2, clamped)
+    sigma_b: 0.768       # blur-model intercept (higher => less blur estimated => weaker deblur)
     alpha: 3              # mid-frequency deconvolution strength (tuned: synthetic-GT + Canon)
     beta: 3               # high-frequency deconvolution strength (tuned)
     remove_halo: true     # suppress deblur halos at strong edges

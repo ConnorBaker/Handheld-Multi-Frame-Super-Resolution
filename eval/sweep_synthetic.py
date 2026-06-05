@@ -17,6 +17,11 @@ and the chosen stage's response params are tuned. The objective scores the
 known GT (over-sharpening is penalised); the ``default`` reference now also runs
 the shipped post-processing, so "best" is measured against the real pipeline.
 
+The synthetic forward model injects a known optical PSF + lateral CA (``OPTICS``,
+applied per frame in ``synthetic.make_synthetic_burst``) so the deblur/defringe
+have a real degradation to invert -- without it the merge already removes
+everything the GT comparison can see and post-processing can only amplify noise.
+
 Usage:
     python -m eval.sweep_synthetic --trials 120 --outdir results/eval/sweep_synth_v2
 """
@@ -43,6 +48,13 @@ SCENES = [
     ("test_burst/Samsung_dataset/0001/Canon/im.JPG", 1200, 2600, 1024),
     ("test_burst/Samsung_dataset/0050/Canon/im.JPG", 1200, 2600, 1024),
 ]
+
+# Known optical degradation injected into the synthetic forward model (px at GT
+# 2x scale) so the deblur/aberration stages have a real PSF + lateral CA to invert
+# and the clean-GT comparison can reward them. Field-varying blur (sharper centre,
+# blurrier corner) + radial R/B chromatic shift. Provisional, moderate values --
+# calibrate from a real lens (e.g. DxO lens-measured corrections) when available.
+OPTICS = dict(psf_sigma=1.2, psf_sigma_corner=2.0, ca_px=2.5)
 
 
 def load_scenes(scenes=SCENES):
@@ -83,9 +95,9 @@ def _suggest_post(trial):
     Stage A (Polyblur ``deblur``) and Stage B (``aberration`` = per-tile deblur +
     learned defringer) are mutually exclusive, matching ``raw2rgb.postprocess``
     precedence (aberration > deblur > sharpen). ``none`` keeps the bare merge as a
-    baseline. Structural / calibration knobs (patch_size, overlap, ker_size, c,
-    sigma_b) stay at their shipped values; only the deconvolution response params
-    and the on/off sub-stage toggles are swept.
+    baseline. Swept: the deconvolution response (alpha, beta), the blur-model
+    (c, sigma_b -- the lever that sets how much blur is estimated/inverted), and
+    the on/off sub-stage toggles. Fixed: patch_size, overlap, ker_size (structural).
     """
     mode = trial.suggest_categorical("post_mode", ["none", "deblur", "aberration"])
     ov = {
@@ -94,12 +106,16 @@ def _suggest_post(trial):
         "postprocessing.sharpening.enabled": False,
     }
     if mode == "deblur":
+        ov["postprocessing.deblur.c"] = trial.suggest_float("db_c", 0.2, 0.6)
+        ov["postprocessing.deblur.sigma_b"] = trial.suggest_float("db_sigma_b", 0.2, 0.9)
         ov["postprocessing.deblur.alpha"] = trial.suggest_float("db_alpha", 0.0, 8.0)
         ov["postprocessing.deblur.beta"] = trial.suggest_float("db_beta", 0.0, 8.0)
         ov["postprocessing.deblur.n_iter"] = trial.suggest_int("db_n_iter", 1, 3)
         ov["postprocessing.deblur.remove_halo"] = trial.suggest_categorical("db_remove_halo", [True, False])
         ov["postprocessing.deblur.prefiltering"] = trial.suggest_categorical("db_prefiltering", [True, False])
     elif mode == "aberration":
+        ov["postprocessing.aberration.c"] = trial.suggest_float("ab_c", 0.2, 0.6)
+        ov["postprocessing.aberration.sigma_b"] = trial.suggest_float("ab_sigma_b", 0.2, 0.9)
         ov["postprocessing.aberration.alpha"] = trial.suggest_float("ab_alpha", 0.0, 8.0)
         ov["postprocessing.aberration.beta"] = trial.suggest_float("ab_beta", 0.0, 8.0)
         ov["postprocessing.aberration.do_deblur"] = trial.suggest_categorical("ab_do_deblur", [True, False])
@@ -159,8 +175,10 @@ def run_sweep(n_trials=60, outdir="results/eval/sweep_synth", study_name="synth_
     os.makedirs(outdir, exist_ok=True)
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     gts = load_scenes()
-    # precompute synthetic bursts once (same noisy LR frames for every trial -> fair)
-    bursts = [syn.make_synthetic_burst(gt, n=8, alpha=1e-4, seed=i)[0] for i, gt in enumerate(gts)]
+    # precompute synthetic bursts once (same noisy LR frames for every trial -> fair).
+    # OPTICS injects a known PSF + lateral CA so deblur/aberration have a real target.
+    bursts = [syn.make_synthetic_burst(gt, n=8, alpha=1e-4, seed=i, **OPTICS)[0]
+              for i, gt in enumerate(gts)]
     print(f"[scenes] {len(gts)} GT crops")
 
     base_loss, base_s, base_d, base_sh, base_psnr = score_config(gts, bursts, None)
