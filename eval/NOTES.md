@@ -100,3 +100,45 @@ Takeaway: the stock defaults over-denoise and under-reject for low-ISO bursts;
 pushing toward detail-preservation + aggressive robustness recovers detail and
 makes fusion a net win. **Caveat:** tuned on one scene — validate across
 0000–0004/0050 (the harness takes any `--burst/--canon`) before adopting.
+
+## Adversarial review (IMPORTANT — read before trusting the sweep)
+
+A self-critique with experiments (`eval/synthetic.py`) walked back several claims:
+
+- **The Canon-DISTS objective is gameable and the "best" config over-sharpens.**
+  Synthetic ground-truth test (downsample a sharp image into a shifted burst,
+  SR back, compare to the KNOWN original — perfect registration, no parallax):
+  the swept "best" gives DISTS 0.073 but **PSNR 34.8 < default 36.2**, SSIM
+  0.94 < 0.96, and **sharpness 109 > GT's 96** (invents high-freq). On real data
+  it has **4.9× the flat-sky high-pass noise** of the default (1.30 vs 0.27).
+  So the "−19% DISTS, 2.7× sharper" win was largely the metric being gamed by
+  over-sharpening/noise amplification, not true fidelity. DISTS rewards
+  perceptual texture; vs a sharp JPEG it favours adding high-freq.
+- **The Canon comparison is not ground truth.** Different sensor/lens/viewpoint →
+  a single homography can't register a 3-D scene (parallax); Canon JPEG carries
+  its own demosaic/sharpening/tone curve; my output is downsampled to Canon res;
+  color-match is crude. Foreground/tree tiles mix registration error with
+  algorithm error. ⇒ demote Canon-DISTS to a sanity check; tune against
+  **synthetic GT fidelity** instead.
+- **The implementation is, however, fundamentally correct.** On synthetic data
+  the default config's multi-frame x2 cleanly beats baselines vs known GT:
+  PSNR 36.2 vs 30.8 (single↑2) vs 29.7 (bilinear↑2); DISTS 0.108 vs 0.148 vs
+  0.167; sharpness 67.7 vs 17.8 (3.8×). A broken merge/align/port could not
+  produce a +5.4 dB SR gain. So "multi < single" / "softer than bilinear" on REAL
+  data is the real-world confounds (over-denoising clean ISO-100 + sensor/lens
+  MTF + parallax), not a gross port bug. (Bit-vs-numba still unverified.)
+- **Generalization: poor.** Sweep = one scene, one (flawed) metric. The "best"
+  (no denoise, aggressive rejection) is tuned to clean ISO-100 static and would
+  hurt noisy/dynamic bursts. Defaults remain the sane general-purpose choice.
+- **Patch size is constrained and global.** Tile sizes are hard-limited to
+  {8,16,32,64} by the torch L2 box filters (`tile=4` → "Box filter not
+  implemented"); patch size is fixed per pyramid level and cannot adapt to local
+  content, so a 16-px patch over a depth/motion boundary (foliage) gets one flow
+  vector → smear. On static synthetic, 16 (default) is best, 32 slightly worse;
+  the dynamic-content case is untested and partly blocked by that constraint. I
+  did NOT sweep patch size.
+
+Bottom line: trust `eval/synthetic.py` (fidelity vs known GT) over the
+Canon-DISTS sweep. The pipeline works; the defaults over-denoise low-ISO; the
+sweep "win" was metric-gaming; the real detail ceiling is mostly the phone
+optics/sensor + the Bayer/merge reconstruction, not a fixable parameter.
