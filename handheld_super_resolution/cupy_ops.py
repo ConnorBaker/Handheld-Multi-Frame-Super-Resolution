@@ -4,8 +4,9 @@ These exist so the pipeline runs on GPUs where numba's CUDA target cannot JIT
 (e.g. Blackwell / GB10, where ptxas rejects the PTX version numba emits). All
 torch-based code in the pipeline already runs on such GPUs; only the numba
 kernels are replaced here, with vectorized CuPy / cupyx.scipy where the math is
-a standard image op, and CuPy ``RawModule`` kernels for the genuinely custom
-scatter/gather (merge) and the Dogson warp-upscale.
+a standard image op. The one genuinely custom scatter/gather (the merge) is an
+NVIDIA Warp kernel re-exported from ``warp_ops`` (see the bottom of this file);
+the Dogson warp-upscale is a vectorized CuPy gather.
 
 Inputs may be torch tensors, numba device arrays or cupy arrays — all expose
 ``__cuda_array_interface__`` so ``cp.asarray`` ingests them zero-copy.
@@ -391,195 +392,14 @@ def estimate_cov_cupy(full_grads, k_detail, k_denoise, D_th, D_tr,
     return covs
 
 
-def _interp_cov_bilinear(covs, fy_floor, fx_floor, fy_ceil, fx_ceil, frac_y, frac_x):
-    """Bilinear-interpolate the (...,2,2) cov grid and return inverse components."""
-    cov_h, cov_w = covs.shape[:2]
-
-    def at(yy, xx, a, b):
-        return covs[cp.clip(yy, 0, cov_h - 1), cp.clip(xx, 0, cov_w - 1), a, b]
-
-    def lerp(a, b):
-        c00 = at(fy_floor, fx_floor, a, b)
-        c01 = at(fy_floor, fx_ceil, a, b)
-        c10 = at(fy_ceil, fx_floor, a, b)
-        c11 = at(fy_ceil, fx_ceil, a, b)
-        top = c00 + frac_x * (c01 - c00)
-        bot = c10 + frac_x * (c11 - c10)
-        return top + frac_y * (bot - top)
-
-    ixx, ixy, iyy = lerp(0, 0), lerp(0, 1), lerp(1, 1)
-    det = ixx * iyy - ixy * ixy
-    inv = 1.0 / det
-    return inv * iyy, -inv * ixy, inv * ixx
-
-
-def merge_accumulate_cupy(comp_img, alignments, covs, r, bayer_mode, iso_kernel,
-                          scale, tile_size, cfa_pattern, num, den):
-    """Alg. 4 accumulation of a comparison frame into num/den (in place).
-
-    Pure CuPy: one vectorized pass per 3x3 neighbour offset (a bounded gather,
-    not a scatter), with elementwise cov interpolation / kernel weights and
-    per-Bayer-channel masked accumulation. Matches the RawKernel
-    (test/test_kernel_equivalence.py).
-    """
-    comp = cp.asarray(comp_img, dtype=cp.float32)
-    al = cp.asarray(alignments, dtype=cp.float32)
-    covs = cp.asarray(covs, dtype=cp.float32)
-    r = cp.asarray(r, dtype=cp.float32)
-    cfa = cp.asarray(cfa_pattern).astype(cp.int32)
-    num = cp.asarray(num)
-    den = cp.asarray(den)
-    hr_h, hr_w, _ = num.shape
-    lr_h, lr_w = comp.shape
-    np_y, np_x, _ = al.shape
-    n_ch = 3 if bayer_mode else 1
-
-    I, J = cp.meshgrid(cp.arange(hr_h, dtype=cp.float32), cp.arange(hr_w, dtype=cp.float32), indexing="ij")
-    lr_x = (J + 0.5) / scale
-    lr_y = (I + 0.5) / scale
-    px = cp.minimum((lr_x / tile_size).astype(cp.int32), np_x - 1)
-    py = cp.minimum((lr_y / tile_size).astype(cp.int32), np_y - 1)
-    flowx = al[py, px, 0]
-    flowy = al[py, px, 1]
-    local_r = r[cp.minimum(lr_y.astype(cp.int32), lr_h - 1), cp.minimum(lr_x.astype(cp.int32), lr_w - 1)]
-    lr_mov_x = lr_x + flowx
-    lr_mov_y = lr_y + flowy
-    mov_inb = (lr_mov_x >= 0) & (lr_mov_x < lr_w) & (lr_mov_y >= 0) & (lr_mov_y < lr_h)
-
-    if not iso_kernel:
-        if bayer_mode:
-            kmap_j, kmap_i = lr_mov_x / 2.0 - 0.5, lr_mov_y / 2.0 - 0.5
-        else:
-            kmap_j, kmap_i = lr_mov_x - 0.5, lr_mov_y - 0.5
-        ikx, iky = kmap_j.astype(cp.int32), kmap_i.astype(cp.int32)  # trunc toward zero
-        frac_x, frac_y = kmap_j - ikx, kmap_i - iky
-        fx_fl, fy_fl = cp.maximum(ikx, 0), cp.maximum(iky, 0)
-        cov_i_xx, cov_i_xy, cov_i_yy = _interp_cov_bilinear(
-            covs, fy_fl, fx_fl, fy_fl + 1, fx_fl + 1, frac_y, frac_x)
-
-    center_j = lr_mov_x.astype(cp.int32)
-    center_i = lr_mov_y.astype(cp.int32)
-    lr_mov_j = lr_mov_x - 0.5
-    lr_mov_i = lr_mov_y - 0.5
-    val = [cp.zeros((hr_h, hr_w), cp.float32) for _ in range(n_ch)]
-    acc = [cp.zeros((hr_h, hr_w), cp.float32) for _ in range(n_ch)]
-    for di in (-1, 0, 1):
-        for dj in (-1, 0, 1):
-            j = center_j + dj
-            i = center_i + di
-            nb = (j >= 0) & (j < lr_w) & (i >= 0) & (i < lr_h)
-            c = comp[cp.clip(i, 0, lr_h - 1), cp.clip(j, 0, lr_w - 1)]
-            dx = j.astype(cp.float32) - lr_mov_j
-            dy = i.astype(cp.float32) - lr_mov_i
-            if iso_kernel:
-                z = 2.0 * (dx * dx + dy * dy)
-            else:
-                z = cov_i_xx * dx * dx + 2.0 * cov_i_xy * dx * dy + cov_i_yy * dy * dy
-            w = cp.exp(-0.5 * cp.maximum(z, 0.0))
-            wv = w * local_r * c * nb
-            wa = w * local_r * nb
-            if bayer_mode:
-                chan = cfa[i & 1, j & 1]
-                for ch in range(3):
-                    m = chan == ch
-                    val[ch] += wv * m
-                    acc[ch] += wa * m
-            else:
-                val[0] += wv
-                acc[0] += wa
-    for ch in range(n_ch):
-        num[..., ch] += val[ch] * mov_inb
-        den[..., ch] += acc[ch] * mov_inb
-    return num, den
-
-
-def merge_ref_accumulate_cupy(ref_img, covs, bayer_mode, iso_kernel, scale,
-                              cfa_pattern, num, den, acc_rob,
-                              robustness_denoise, max_frame_count, rad_max, max_multiplier):
-    """Alg. 11 accumulation of the reference frame into num/den (in place).
-
-    Pure CuPy, mirroring the RawKernel: flow=0, the coarse position is hr/scale
-    (no +0.5), the cov grid is sampled with floor (not truncation), and the
-    optional robustness-aware denoiser varies the radius/blur per pixel and may
-    overwrite (single-frame mode). Matches the RawKernel
-    (test/test_kernel_equivalence.py).
-    """
-    ref = cp.asarray(ref_img, dtype=cp.float32)
-    covs = cp.asarray(covs, dtype=cp.float32)
-    cfa = cp.asarray(cfa_pattern).astype(cp.int32)
-    num = cp.asarray(num)
-    den = cp.asarray(den)
-    hr_h, hr_w, _ = num.shape
-    lr_h, lr_w = ref.shape
-    n_ch = 3 if bayer_mode else 1
-
-    I, J = cp.meshgrid(cp.arange(hr_h, dtype=cp.float32), cp.arange(hr_w, dtype=cp.float32), indexing="ij")
-    crp_y = I / scale
-    crp_x = J / scale
-
-    if not iso_kernel:
-        if bayer_mode:
-            gy, gx = (crp_y - 0.5) / 2.0, (crp_x - 0.5) / 2.0
-        else:
-            gy, gx = crp_y, crp_x
-        floor_y = cp.maximum(cp.floor(gy).astype(cp.int32), 0)
-        floor_x = cp.maximum(cp.floor(gx).astype(cp.int32), 0)
-        fy = gy - cp.floor(gy)
-        fx = gx - cp.floor(gx)
-        cov_i_xx, cov_i_xy, cov_i_yy = _interp_cov_bilinear(
-            covs, floor_y, floor_x, floor_y + 1, floor_x + 1, fy, fx)
-
-    if robustness_denoise:
-        acc_rob = cp.asarray(acc_rob if acc_rob is not None else cp.zeros((1, 1)), dtype=cp.float32)
-        ah, aw = acc_rob.shape
-        ir = cp.minimum(cp.rint(crp_y).astype(cp.int32), ah - 1)
-        jr = cp.minimum(cp.rint(crp_x).astype(cp.int32), aw - 1)
-        local_acc_r = acc_rob[cp.clip(ir, 0, ah - 1), cp.clip(jr, 0, aw - 1)]
-        cond = local_acc_r <= max_frame_count
-        add_denoise = cp.where(cond, cp.float32(max_multiplier), cp.float32(1.0))
-        rad_pix = cp.where(cond, int(rad_max), 1)
-        rad_loop = max(int(rad_max), 1)
-    else:
-        add_denoise = cp.float32(1.0)
-        rad_pix = None
-        rad_loop = 1
-
-    center_x = cp.rint(crp_x).astype(cp.int32)
-    center_y = cp.rint(crp_y).astype(cp.int32)
-    val = [cp.zeros((hr_h, hr_w), cp.float32) for _ in range(n_ch)]
-    acc = [cp.zeros((hr_h, hr_w), cp.float32) for _ in range(n_ch)]
-    for di in range(-rad_loop, rad_loop + 1):
-        for dj in range(-rad_loop, rad_loop + 1):
-            pidx = center_x + dj
-            pidy = center_y + di
-            nb = (pidx >= 0) & (pidx < lr_w) & (pidy >= 0) & (pidy < lr_h)
-            if rad_pix is not None:
-                nb = nb & (abs(di) <= rad_pix) & (abs(dj) <= rad_pix)
-            c = ref[cp.clip(pidy, 0, lr_h - 1), cp.clip(pidx, 0, lr_w - 1)]
-            dx = pidx.astype(cp.float32) - crp_x
-            dy = pidy.astype(cp.float32) - crp_y
-            if iso_kernel:
-                y = 2.0 * (dx * dx + dy * dy)
-            else:
-                y = cov_i_xx * dx * dx + 2.0 * cov_i_xy * dx * dy + cov_i_yy * dy * dy
-            w = cp.exp(-0.5 * (cp.maximum(y, 0.0) / add_denoise))
-            if bayer_mode:
-                chan = cfa[pidy & 1, pidx & 1]
-                for ch in range(3):
-                    m = chan == ch
-                    val[ch] += c * w * nb * m
-                    acc[ch] += w * nb * m
-            else:
-                val[0] += c * w * nb
-                acc[0] += w * nb
-
-    if robustness_denoise:
-        overwrite = local_acc_r < max_frame_count
-        for ch in range(n_ch):
-            num[..., ch] = cp.where(overwrite, val[ch], num[..., ch] + val[ch])
-            den[..., ch] = cp.where(overwrite, acc[ch], den[..., ch] + acc[ch])
-    else:
-        for ch in range(n_ch):
-            num[..., ch] += val[ch]
-            den[..., ch] += acc[ch]
-    return num, den
+# ---------------------------------------------------------------------------
+# Merge accumulation -- NVIDIA Warp kernels (see warp_ops.py).
+#
+# numba can't JIT on the GB10 and cupyx.jit chokes on the merge's mixed
+# int32/uint32/float typing, so the merge is expressed as Warp kernels (Python
+# -> CUDA via NVRTC, single fused gather per output pixel). Re-exported here so
+# callers keep importing the merge from cupy_ops. Same arithmetic as the
+# reference RawModule (test/reference_kernels.py); verified by
+# test/test_kernel_equivalence.py.
+# ---------------------------------------------------------------------------
+from .warp_ops import merge_accumulate_cupy, merge_ref_accumulate_cupy  # noqa: E402,F401

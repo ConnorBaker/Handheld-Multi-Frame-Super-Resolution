@@ -1,6 +1,7 @@
 numpy
 scipy
 omegaconf
+warp-lang
 rawpy
 exifread
 opencv-python-headless

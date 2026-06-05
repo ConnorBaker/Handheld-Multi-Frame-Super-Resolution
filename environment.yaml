@@ -1,11 +1,12 @@
 # Conda/micromamba environment for the handheld pipeline.
 #
 # Tested stack (NVIDIA GB10 / Grace Blackwell, sm_121, CUDA 13.2):
-#   python 3.12, pytorch 2.11, cupy 14.1, numba 0.65.
+#   python 3.12, pytorch 2.12, cupy 14.1, numba 0.65, warp-lang 1.14.
 # The previous python=3.9 / pytorch=1.13 / pytorch-cuda=11.6 pins do NOT run on
 # Blackwell GPUs. CuPy is now a hard dependency: numba's CUDA target cannot JIT
 # on this hardware (ptxas rejects the PTX version numba emits), so the GPU
-# routines run through CuPy / torch instead.
+# routines run through CuPy / torch instead. The custom merge gather runs as an
+# NVIDIA Warp kernel (warp-lang, installed via requirements.txt).
 #
 # Create with:  micromamba create -f environment.yaml
 name: handheld

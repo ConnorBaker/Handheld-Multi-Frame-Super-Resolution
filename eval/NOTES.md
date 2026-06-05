@@ -211,10 +211,12 @@ Corrected recommendations (verified):
 - **L1 integer-shift sampling** → padded slicing (cupy core) or
   `sliding_window_view`; `map_coordinates` is unnecessary for integer shifts
   (verified bit-identical to slicing).
-- **Merge** is a bounded 3x3 GATHER (1 thread/output) — earlier "needs a custom
-  kernel" was too strong. It is expressible with cupy primitives (per-offset
-  fancy-index/`map_coordinates` gather + elementwise weight + per-channel masked
-  add, or `cupyx.scatter_add`). The RawKernel is an optimization, not a necessity.
+- **Merge** is a bounded 3x3 GATHER (1 thread/output). It *is* expressible with
+  cupy primitives (per-offset fancy-index/`map_coordinates` gather + elementwise
+  weight + per-channel masked add, or `cupyx.scatter_add`) — so a custom kernel
+  isn't *required* for correctness — but that vectorized form is ~9x slower
+  (full-grid temporaries; see perf section). The fused per-output kernel is the
+  right call here; it now lives as a Warp kernel (`warp_ops.py`), not a RawModule.
 - **Reshape+sum tile reductions / `map_coordinates(order=1)` sub-pixel warp /
   closed-form 2x2** are already idiomatic cupy — keep (no `block_reduce` in core).
 
@@ -231,19 +233,41 @@ robustness denoiser). All pass.
 | L2 box filter | `t x t` `torch.ones` conv | `F.avg_pool2d * t^2` (any t) | rtol 1e-3 |
 | L1 block matching | `map_coordinates(order=0)` | integer zero-filled gather (`cp` slicing) | bit-identical |
 | Dogson warp-upscale | `RawModule` kernel | vectorized 3x3 Dogson-weighted gather | rtol 1e-3 |
-| merge accumulate | `RawModule` (atomic-free gather) | vectorized 9-tap gather + masked channel add | rtol 1e-3 |
-| merge accumulate_ref | `RawModule` | vectorized (per-pixel rad / denoise / overwrite) | rtol 1e-3 |
+| merge accumulate | `RawModule` (atomic-free gather) | **NVIDIA Warp kernel** (`warp_ops.py`) | rtol 1e-3 |
+| merge accumulate_ref | `RawModule` | **NVIDIA Warp kernel** (`warp_ops.py`) | rtol 1e-3 |
 
-**Perf cost (honest):** the merge rewrite makes a full burst ~9x slower at
-scale 2 (real 12->48 MP burst 0003: **3.9 s -> 37.5 s**). The fused RawKernel
-did the 9-tap gather + cov-interp + channel routing in one pass; the vectorized
-version materializes many full-grid (HxWx, ~190 MB) temporaries. merge is the one
-op where the RawKernel was genuinely justified (a bounded gather with per-output
-anisotropic kernels + Bayer routing). Options if throughput matters: re-promote
-the merge RawKernel from `test/reference_kernels.py` into production (it stays
-regression-tested against the vectorized version), or optimize the vectorized
-merge (fuse channels, fewer temporaries). The other rewrites (box filter, L1,
-Dogson) are equal-or-faster and idiomatic — keep.
+**Perf (resolved — the merge is now a Warp kernel).** The intermediate
+*vectorized* merge was a real ~9x regression at scale 2 (real 12->48 MP burst
+0003: **3.9 s -> 37.5 s**): a 9-tap gather + cov-interp + channel routing has no
+fusable cupy expression, so it materialized many full-grid (HxWx, ~190 MB)
+temporaries. That's the one op where the fused per-output kernel is genuinely
+justified (bounded gather with per-output anisotropic kernels + Bayer routing).
+
+Tried in order: (1) re-promote the `RawModule` C++ string — works but is
+opaque C in a Python string; (2) `cupyx.jit.rawkernel` (Python->CUDA via NVRTC)
+— **fails to compile** the merge: `threadIdx` is `uint32` and the index math
+mixes it with `int32` shape args, raising `TypeError: Cannot cast from 'int32'
+to uint32 with casting rule same_kind`; workable only with pervasive explicit
+casts that defeat the readability goal. (3) **NVIDIA Warp** (`warp-lang`, already
+in the stack) — its kernel DSL handles the int/float typing cleanly, JITs via
+NVRTC, and reads as plain Python. CuPy arrays wrap zero-copy via `wp.from_dlpack`
+(launch device is `cuda:<dev>`, NOT `str(cp_array.device)` which gives the
+unparseable `<CUDA Device 0>`). Benchmarked at scale-2 HR (6048x8064x3, 48.8 MP):
+**Warp 0.0166 s/frame vs the original RawModule 0.0257 s/frame** — Warp is ~1.5x
+*faster* than the kernel it replaces, and the full burst is back to ~6.5 s. The
+RawModule/`map_coordinates` originals are preserved in
+`test/reference_kernels.py`; `test/test_kernel_equivalence.py` (38 cases) asserts
+the Warp merge matches them. The other rewrites (box filter, L1, Dogson) are
+equal-or-faster pure cupy/torch — keep.
+
+**Aside — Warp tiles.** Warp 1.14 *does* expose `wp.tile_load` /
+`wp.tile_matmul` / `wp.tile_zeros` / `wp.tile_store` as kernel builtins (an
+earlier note here that it didn't was wrong — they're not module-level attrs, so
+`hasattr(wp, "tile_load")` is False, but they compile and run inside `@wp.kernel`;
+verified a tile_load+tile_matmul kernel matches `numpy @` on the GB10). They're
+not used for the merge because the merge is a *gather*, not a matmul — a plain
+per-output Warp kernel fits it. Warp tiles would suit the tile-structured
+align/block-matching/Hessian ops if those are ever moved off torch.
 
 ### Net correction to earlier claims
 - Pipeline + port: **correct** (multi-frame SR beats baselines vs true GT across
