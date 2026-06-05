@@ -16,8 +16,7 @@ from .filters import fourier_gradients
 
 
 def gaussian_blur_estimation(imgc, q=0.0001, n_angles=6, n_interpolated_angles=30, c=0.362, b=0.464, ker_size=25,
-                                   discard_saturation=False, multichannel=False, thetas=None, interpolated_thetas=None,
-                                   return_2d_filters=True):
+                                   discard_saturation=False, multichannel=False, thetas=None, interpolated_thetas=None):
     """
     Compute an approximate Gaussian filter from a RGB or grayscale image.
         :param img: (B,C,H,W) or (B,1,H,W) tensor, the image
@@ -46,13 +45,8 @@ def gaussian_blur_estimation(imgc, q=0.0001, n_angles=6, n_interpolated_angles=3
         if torch.cuda.is_available():
             interpolated_thetas = interpolated_thetas.to(imgc.device)
 
-    # kernel estimation
-    if return_2d_filters:
-        kernel = torch.zeros(*imgc.shape[:2], ker_size, ker_size, device=imgc.device).float()  # BxCxhxw or Bx1xhxw
-    else:
-        kernel = (torch.zeros(*imgc.shape[:2], device=imgc.device),  # sigmas
-                  torch.zeros(*imgc.shape[:2], device=imgc.device),  # rhos
-                  torch.zeros(*imgc.shape[:2], device=imgc.device))  # thetas
+    # kernel estimation (one 2D Gaussian filter per channel)
+    kernel = torch.zeros(*imgc.shape[:2], ker_size, ker_size, device=imgc.device).float()  # BxCxhxw or Bx1xhxw
     for channel in range(imgc.shape[1]):
         img = imgc[:, channel:channel+1]  # Bx1xHxW
         # (Optional) remove saturated areas
@@ -68,14 +62,9 @@ def gaussian_blur_estimation(imgc, q=0.0001, n_angles=6, n_interpolated_angles=3
                                                                                 thetas, interpolated_thetas)
         # finally compute the Gaussian parameters
         sigma, rho = compute_gaussian_parameters(magnitude_normal, magnitude_ortho, c=c, b=b)
-        # create the blur kernel or store the Gaussian parameters
-        if return_2d_filters:
-            kernel[:, channel:channel+1] = create_gaussian_filter(thetas, sigma, rho, ksize=ker_size)
-        else:
-            kernel[0][:,channel:channel+1] = sigma
-            kernel[1][:,channel:channel+1] = rho
-            kernel[2][:,channel:channel+1] = theta
-        
+        # create the blur kernel
+        kernel[:, channel:channel+1] = create_gaussian_filter(thetas, sigma, rho, ksize=ker_size)
+
     return kernel
 
 

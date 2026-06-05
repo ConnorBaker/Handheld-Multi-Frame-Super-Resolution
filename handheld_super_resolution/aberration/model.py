@@ -152,8 +152,7 @@ class AberrationCorrection(nn.Module):
                 patch = pb_deblur.polyblur_deblurring(
                     patch, n_iter=polyblur_iters, c=c, b=sigma_b, q=q,
                     alpha=alpha, beta=b, ker_size=self.ker_size,
-                    remove_halo=False, prefiltering=False, edgetaping=False,
-                    method='fft')
+                    remove_halo=False, prefiltering=False, edgetaping=False)
                 patch = patch.clamp(0, 1)
             if do_defringe:
                 # R defringed using (R,G); B defringed using (B,G). Predict residual.

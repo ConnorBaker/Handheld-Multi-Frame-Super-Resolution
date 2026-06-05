@@ -17,8 +17,8 @@ from time import time
 
 
 def polyblur_deblurring(img, n_iter=1, c=0.352, b=0.768, alpha=2, beta=3, sigma_r=0.8, sigma_s=2.0, ker_size=25, q=0.0, n_angles=6,
-                        n_interpolated_angles=30, remove_halo=False, edgetaping=False, prefiltering=False, 
-                        discard_saturation=False, multichannel_kernel=False, method='fft', verbose=False):
+                        n_interpolated_angles=30, remove_halo=False, edgetaping=False, prefiltering=False,
+                        discard_saturation=False, multichannel_kernel=False, verbose=False):
     """
     Meta Functional implementation of Polyblur.
     :param img: (H, W) or (H,W,3) np.array or (B,C,H,W) torch.tensor, the blurry image(s)
@@ -35,7 +35,6 @@ def polyblur_deblurring(img, n_iter=1, c=0.352, b=0.768, alpha=2, beta=3, sigma_
     :param prefiltering: bool, using or not smooth and textured images split to prevent noise magnification
     :param discard_saturation: bool, should we discard saturated pixels? (recommanded)
     :param multichannel_kernel: bool, predicting a kernel common to each color channel or a single kernel per color channel
-    :param method: string, weither running the convolution in time or fourier domain
     :return: impred: np.array or torch.tensor of same size as img, the restored image(s)
     """
     ## Convert to torch.Tensor from numpy.ndarray
@@ -44,12 +43,6 @@ def polyblur_deblurring(img, n_iter=1, c=0.352, b=0.768, alpha=2, beta=3, sigma_
         img = utils.to_tensor(img).unsqueeze(0)
     else:
         flag_numpy = False
-
-    ## Which format for the kernel: 2D filter (FFT or direct) or tuple of parameters (direct separable)?
-    if method == 'direct_separable':
-        return_2d_filters = False
-    else:
-        return_2d_filters = True
 
     ## Init the variables
     start = time()
@@ -64,10 +57,9 @@ def polyblur_deblurring(img, n_iter=1, c=0.352, b=0.768, alpha=2, beta=3, sigma_
     for n in range(n_iter):
         ## Blur estimation
         start = time()
-        kernel = blur_estimation.gaussian_blur_estimation(impred, c=c, b=b, q=q, discard_saturation=discard_saturation, 
-                                                          ker_size=ker_size, multichannel=multichannel_kernel, 
-                                                          thetas=thetas, interpolated_thetas=interpolated_thetas,
-                                                          return_2d_filters=return_2d_filters)
+        kernel = blur_estimation.gaussian_blur_estimation(impred, c=c, b=b, q=q, discard_saturation=discard_saturation,
+                                                          ker_size=ker_size, multichannel=multichannel_kernel,
+                                                          thetas=thetas, interpolated_thetas=interpolated_thetas)
         if verbose:
             print('-- blur estimation %d: %1.5f' % (n+1, time() - start))
 

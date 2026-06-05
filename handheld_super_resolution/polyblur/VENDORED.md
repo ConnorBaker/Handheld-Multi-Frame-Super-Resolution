@@ -49,5 +49,10 @@ lines, again bit-identical):
   `blur_estimation.py`, which imported but never called it).
 - `edgetaper.py` — `edgetaper` lost its now-redundant `method` arg and a dead
   `_kernel` local.
-
-The public `polyblur_deblurring(..., method='fft')` signature is unchanged.
+- `blur_estimation.py` — `gaussian_blur_estimation` lost its `return_2d_filters`
+  arg and the kernel-as-`(sigma, rho, theta)`-tuple branch it gated (used only by
+  `direct_separable`; that branch's `kernel[2][...] = theta` referenced an
+  undefined `theta` — another never-run NameError).
+- The now-vestigial `method` arg was dropped from the public
+  `polyblur_deblurring` and from both call sites (`raw2rgb._deblur`,
+  `aberration/model.py`); the deblur path is unconditionally FFT.

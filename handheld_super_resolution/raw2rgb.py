@@ -231,7 +231,6 @@ def _deblur(img, deblur_config):
         remove_halo=bool(deblur_config.get("remove_halo", True)),
         prefiltering=bool(deblur_config.get("prefiltering", True)),
         edgetaping=bool(deblur_config.get("edgetaping", True)),
-        method="fft",
     )
     return out.squeeze(0).permute(1, 2, 0).contiguous().cpu().numpy()
 
