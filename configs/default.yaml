@@ -49,11 +49,11 @@ postprocessing:
     enabled: true
     amount: 1.5
     radius: 3
-  deblur:                 # Polyblur blind deblur (vendored); replaces sharpening when enabled
-    enabled: false
+  deblur:                 # Polyblur blind deblur (vendored); ON by default, replaces sharpening
+    enabled: true
     n_iter: 1
-    alpha: 2              # mid-frequency deconvolution strength
-    beta: 3               # high-frequency deconvolution strength
+    alpha: 3              # mid-frequency deconvolution strength (tuned: synthetic-GT + Canon)
+    beta: 3               # high-frequency deconvolution strength (tuned)
     remove_halo: true     # suppress deblur halos at strong edges
     prefiltering: true    # base/detail split to limit noise amplification
     edgetaping: true

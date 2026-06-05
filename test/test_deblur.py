@@ -13,6 +13,8 @@ mitigations prevent). Observed (deterministic): sharpness 0.75 -> 0.84,
 PSNR 37.2 -> 38.5 dB.
 """
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 from omegaconf import OmegaConf
@@ -23,6 +25,7 @@ from eval import pipeline_runner as pr
 from handheld_super_resolution.raw2rgb import _deblur
 
 _CROP = T._CROP
+_DEFAULT_CFG = Path(__file__).resolve().parent.parent / "configs" / "default.yaml"
 
 
 def _sharp(x):
@@ -46,8 +49,9 @@ def recon():
 
 
 def _default_deblur_cfg():
-    return OmegaConf.create(dict(enabled=True, n_iter=1, alpha=2, beta=3,
-                                 remove_halo=True, prefiltering=True, edgetaping=True))
+    """The deblur config actually shipped in configs/default.yaml -- so this test
+    guards the real default (currently enabled, alpha=3, beta=3)."""
+    return OmegaConf.load(_DEFAULT_CFG).postprocessing.deblur
 
 
 def test_deblur_runs_and_is_well_formed(recon):
