@@ -9,6 +9,9 @@ dependencies:
   - pytorch=1.13.1
   - pytorch-cuda=11.6
   - numba
+  - cupy
+  - omegaconf
+  - pytest
   - pip
   - pip:
       - -r requirements.txt

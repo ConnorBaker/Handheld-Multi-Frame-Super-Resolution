@@ -1,6 +1,8 @@
 import math
 
 import numpy as np
+import cupy as cp
+import cupyx.scipy.ndimage as ndx
 from scipy.ndimage._filters import _gaussian_kernel1d
 from numba import cuda
 import torch as th
@@ -113,6 +115,47 @@ def compute_grey_images(img, method):
         
     else:
         raise NotImplementedError('Computation of gray level on GPU is only supported for FFT')
+
+
+# ---------------------------------------------------------------------------
+# CuPy implementations
+#
+# Drop-in equivalents of the torch / numba routines above, ported from the
+# feat/warp branch. They exist so the pipeline can run on GPUs where numba's
+# CUDA target cannot JIT (e.g. when ptxas rejects the PTX version numba emits).
+# Each is covered by an equivalence test in test/test_utils_image.py.
+# ---------------------------------------------------------------------------
+
+def compute_grey_images_fft_cupy(img):
+    """CuPy equivalent of ``compute_grey_images(img, "FFT")``.
+
+    Returns a ``cp.ndarray`` (the torch path returns a numba device array).
+    """
+    imsize_y, imsize_x = img.shape
+    cp_img_grey = cp.asarray(img, dtype=cp.float32)
+    cp_img_grey = cp.fft.fft2(cp_img_grey)
+    cp_img_grey = cp.fft.fftshift(cp_img_grey)
+
+    cp_img_grey[:imsize_y // 4, :] = 0
+    cp_img_grey[:, :imsize_x // 4] = 0
+    cp_img_grey[-imsize_y // 4:, :] = 0
+    cp_img_grey[:, -imsize_x // 4:] = 0
+
+    cp_img_grey = cp.fft.ifftshift(cp_img_grey)
+    cp_img_grey = cp.fft.ifft2(cp_img_grey)
+    return cp_img_grey.real
+
+
+def compute_grey_images_decimate_cupy(img):
+    """CuPy equivalent of ``compute_grey_images(img, "decimating")``.
+
+    Averages 2x2 blocks. The leading odd row/column (if any) is dropped, to
+    match the ``imsize // 2`` output shape of the numba ``cuda_decimate_to_grey``.
+    """
+    img = cp.asarray(img)
+    h, w = img.shape
+    img = img[:2 * (h // 2), :2 * (w // 2)]
+    return (img[0::2, 0::2] + img[1::2, 0::2] + img[0::2, 1::2] + img[1::2, 1::2]) / 4
 
 def GAT(image, alpha, beta):
     """
@@ -389,6 +432,80 @@ def cuda_downsample(th_img, kernel='gaussian', factor=2):
     h2, w2 = np.floor(np.array(th_filteredImage.shape[2:]) / float(factor)).astype(int)
 
     return th_filteredImage[:, :, :h2 * factor:factor, :w2 * factor:factor]
+
+
+def cupy_downsample(img, kernel='gaussian', factor=2):
+    """CuPy equivalent of ``cuda_downsample`` (torch).
+
+    ``img`` is expected to be 4D ``[1, 1, H, W]`` like the torch path. A
+    same-size reflect Gaussian filter is applied, then the interior is cropped
+    with a ``2 * factor`` offset to reproduce the valid-convolution crop the
+    torch version gets from ``F.conv2d`` without padding.
+    """
+    # Special case
+    if factor == 1:
+        return img
+
+    if kernel is None:
+        raise ValueError('use Kernel')
+    elif kernel == 'gaussian':
+        # gaussian kernel std is proportional to downsampling factor
+        filteredImage = ndx.gaussian_filter(
+            cp.asarray(img), sigma=factor * 0.5, order=0, mode='reflect')
+    else:
+        raise ValueError("please use gaussian kernel")
+
+    # Shape of the downsampled image
+    h2, w2 = np.floor(np.array(filteredImage.shape[2:]) / float(factor)).astype(int)
+
+    return filteredImage[
+        :, :,
+        2 * factor:(h2 - 2) * factor:factor,
+        2 * factor:(w2 - 2) * factor:factor]
+
+
+def compute_gradient_cupy(image):
+    """CuPy equivalent of the torch Sobel gradients used in ``ICA.init_ica``.
+
+    Matches ``F.conv2d(image, [-1, 0, 1], padding='same')`` (cross-correlation
+    with zero padding) for both axes. Returns ``(gradx, grady)``.
+    """
+    cp_img = cp.asarray(image, dtype=cp.float32)
+    weights = cp.array([-1, 0, 1], dtype=cp.float32)
+    gradx = ndx.correlate1d(cp_img, weights, axis=1, mode='constant', cval=0)
+    grady = ndx.correlate1d(cp_img, weights, axis=0, mode='constant', cval=0)
+    return gradx, grady
+
+
+def compute_hessian_cupy(gradx, grady, tile_size):
+    """CuPy equivalent of the numba ``ICA.compute_hessian`` kernel.
+
+    Uses floor patch counts (``imsize // tile_size``) and drops the remainder
+    row/column of pixels, matching the numba kernel and the ``unfold`` tiling
+    in ``alignment.init_alignment``. Returns ``(n_patch_y, n_patch_x, 2, 2)``.
+    """
+    gradx = cp.asarray(gradx)
+    grady = cp.asarray(grady)
+    H, W = gradx.shape
+
+    n_patch_y = H // tile_size
+    n_patch_x = W // tile_size
+
+    gx = gradx[:n_patch_y * tile_size, :n_patch_x * tile_size]
+    gy = grady[:n_patch_y * tile_size, :n_patch_x * tile_size]
+    gx = gx.reshape(n_patch_y, tile_size, n_patch_x, tile_size)
+    gy = gy.reshape(n_patch_y, tile_size, n_patch_x, tile_size)
+
+    gx2 = (gx * gx).sum(axis=(1, 3))
+    gy2 = (gy * gy).sum(axis=(1, 3))
+    cross = (gx * gy).sum(axis=(1, 3))
+
+    hessian = cp.empty((n_patch_y, n_patch_x, 2, 2), dtype=DEFAULT_NUMPY_FLOAT_TYPE)
+    hessian[..., 0, 0] = gx2
+    hessian[..., 0, 1] = cross
+    hessian[..., 1, 0] = cross
+    hessian[..., 1, 1] = gy2
+    return hessian
 
 
 @cuda.jit(device=True)
