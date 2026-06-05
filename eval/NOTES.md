@@ -218,6 +218,33 @@ Corrected recommendations (verified):
 - **Reshape+sum tile reductions / `map_coordinates(order=1)` sub-pixel warp /
   closed-form 2x2** are already idiomatic cupy — keep (no `block_reduce` in core).
 
+### Rewrite to library primitives (done) + regression harness
+
+All the size-generalized / hand-written kernels were rewritten to stock CuPy /
+torch primitives; the ORIGINAL implementations are preserved in
+`test/reference_kernels.py` and `test/test_kernel_equivalence.py` asserts the
+rewrites match them (38 cases across bayer/grey, iso/steerable, scale 1/2,
+robustness denoiser). All pass.
+
+| op | before | after | verified |
+|---|---|---|---|
+| L2 box filter | `t x t` `torch.ones` conv | `F.avg_pool2d * t^2` (any t) | rtol 1e-3 |
+| L1 block matching | `map_coordinates(order=0)` | integer zero-filled gather (`cp` slicing) | bit-identical |
+| Dogson warp-upscale | `RawModule` kernel | vectorized 3x3 Dogson-weighted gather | rtol 1e-3 |
+| merge accumulate | `RawModule` (atomic-free gather) | vectorized 9-tap gather + masked channel add | rtol 1e-3 |
+| merge accumulate_ref | `RawModule` | vectorized (per-pixel rad / denoise / overwrite) | rtol 1e-3 |
+
+**Perf cost (honest):** the merge rewrite makes a full burst ~9x slower at
+scale 2 (real 12->48 MP burst 0003: **3.9 s -> 37.5 s**). The fused RawKernel
+did the 9-tap gather + cov-interp + channel routing in one pass; the vectorized
+version materializes many full-grid (HxWx, ~190 MB) temporaries. merge is the one
+op where the RawKernel was genuinely justified (a bounded gather with per-output
+anisotropic kernels + Bayer routing). Options if throughput matters: re-promote
+the merge RawKernel from `test/reference_kernels.py` into production (it stays
+regression-tested against the vectorized version), or optimize the vectorized
+merge (fuse channels, fewer temporaries). The other rewrites (box filter, L1,
+Dogson) are equal-or-faster and idiomatic — keep.
+
 ### Net correction to earlier claims
 - Pipeline + port: **correct** (multi-frame SR beats baselines vs true GT across
   forward models). Earlier real-data "multi < single" was over-denoising clean

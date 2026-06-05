@@ -122,12 +122,17 @@ def ica_iterate_cupy(ref_img, gradx, grady, hessian, moving, alignment, tile_siz
 # Block matching, L1 brute-force integer search  (replaces cuda_L1_local_search*)
 # ---------------------------------------------------------------------------
 def block_matching_l1_cupy(ref_lvl, moving_lvl, alignments, tile_size, search_radius):
-    """Integer-shift L1 block matching.
+    """Integer-shift L1 block matching (pure CuPy: integer gather + reshape-sum).
 
     For each tile, searches integer shifts in [-R, R]^2 around the (rounded)
     current flow and keeps the shift minimizing the per-tile sum of absolute
-    differences. Out-of-bounds moving samples count as 0 (as in the numba
-    kernels). Returns updated alignments (cupy array).
+    differences. Out-of-bounds moving samples count as 0.
+
+    The shifts are integer, so we sample with a plain zero-filled CuPy gather --
+    equivalent to ``map_coordinates(order=0, mode='constant')`` but without the
+    interpolation machinery (see test/test_kernel_equivalence.py). NB: this
+    computes a correct argmin; the original numba L1 kernels had a broken
+    min-search, so this is intentionally *not* a faithful port of that bug.
     """
     ref = cp.asarray(ref_lvl, dtype=cp.float32)
     mov = cp.asarray(moving_lvl, dtype=cp.float32)
@@ -136,15 +141,16 @@ def block_matching_l1_cupy(ref_lvl, moving_lvl, alignments, tile_size, search_ra
     n_patch_y, n_patch_x, _ = flow.shape
     t = tile_size
     H, W = n_patch_y * t, n_patch_x * t
+    mh, mw = mov.shape
     ref = ref[:H, :W]
 
     base_x = cp.round(flow[..., 0])
     base_y = cp.round(flow[..., 1])
-    fx = cp.repeat(cp.repeat(base_x, t, axis=0), t, axis=1)
-    fy = cp.repeat(cp.repeat(base_y, t, axis=0), t, axis=1)
+    fx = cp.repeat(cp.repeat(base_x, t, axis=0), t, axis=1).astype(cp.int32)
+    fy = cp.repeat(cp.repeat(base_y, t, axis=0), t, axis=1).astype(cp.int32)
 
     yy, xx = cp.meshgrid(
-        cp.arange(H, dtype=cp.float32), cp.arange(W, dtype=cp.float32), indexing="ij"
+        cp.arange(H, dtype=cp.int32), cp.arange(W, dtype=cp.int32), indexing="ij"
     )
 
     best_cost = cp.full((n_patch_y, n_patch_x), cp.inf, dtype=cp.float32)
@@ -154,8 +160,10 @@ def block_matching_l1_cupy(ref_lvl, moving_lvl, alignments, tile_size, search_ra
     R = search_radius
     for sy in range(-R, R + 1):
         for sx in range(-R, R + 1):
-            coords = cp.stack([yy + fy + sy, xx + fx + sx], axis=0)
-            shifted = map_coordinates(mov, coords, order=0, mode="constant", cval=0.0)
+            gy = yy + fy + sy
+            gx = xx + fx + sx
+            inb = (gy >= 0) & (gy < mh) & (gx >= 0) & (gx < mw)
+            shifted = cp.where(inb, mov[cp.clip(gy, 0, mh - 1), cp.clip(gx, 0, mw - 1)], cp.float32(0))
             cost = cp.abs(ref - shifted).reshape(n_patch_y, t, n_patch_x, t).sum(axis=(1, 3))
             better = cost < best_cost
             best_cost = cp.where(better, cost, best_cost)
@@ -254,38 +262,54 @@ def local_min_cupy(R):
     return minimum_filter(cp.asarray(R, dtype=cp.float32), size=5, mode="nearest")
 
 
+def _dogson_q(x):
+    """Dogson quadratic kernel (vectorized)."""
+    ax = cp.abs(x)
+    return cp.where(ax <= 0.5, -2.0 * ax * ax + 1.0,
+                    cp.where(ax <= 1.5, ax * ax - 2.5 * ax + 1.5, 0.0)).astype(cp.float32)
+
+
 def upscale_warp_stats_cupy(local_stats, bayer_mode, tile_size=None, flow=None):
     """Dogson biquadratic upscale (x2 in bayer) + optional flow warp.
 
-    Custom interpolation -> RawModule kernel.
+    Pure CuPy: a 3x3 Dogson-weighted gather (the kernel isn't one of
+    map_coordinates' B-spline orders, so the taps are applied explicitly).
+    Out-of-bounds samples -> inf (=> robustness 0 there), matching the original.
     """
-    LR = cp.ascontiguousarray(cp.asarray(local_stats, dtype=cp.float32))
+    LR = cp.asarray(local_stats, dtype=cp.float32)
     n_channels, lny, lnx = LR.shape
-    upscale = 2 if bayer_mode else 1
-    hny, hnx = lny * upscale, lnx * upscale
-    HR = cp.empty((n_channels, hny, hnx), dtype=cp.float32)
+    s = 2 if bayer_mode else 1
+    hny, hnx = lny * s, lnx * s
 
+    Y, X = cp.meshgrid(cp.arange(hny, dtype=cp.float32), cp.arange(hnx, dtype=cp.float32), indexing="ij")
     if flow is None:
-        is_ref = 1
-        flow_arr = cp.zeros((1, 1, 2), dtype=cp.float32)
-        np_y = np_x = 1
-        tile_size = 1
+        flow_y = flow_x = cp.float32(0)
     else:
-        is_ref = 0
-        flow_arr = cp.ascontiguousarray(cp.asarray(flow, dtype=cp.float32))
-        np_y, np_x, _ = flow_arr.shape
+        flow = cp.asarray(flow, dtype=cp.float32)
+        np_y, np_x, _ = flow.shape
+        py = cp.minimum((Y // tile_size).astype(cp.int32), np_y - 1)
+        px = cp.minimum((X // tile_size).astype(cp.int32), np_x - 1)
+        flow_x = flow[py, px, 0]
+        flow_y = flow[py, px, 1]
 
-    kern = _get_module("dogson").get_function("upscale_dogson")
-    tpb = (16, 16)
-    bpg = ((hnx + 15) // 16, (hny + 15) // 16)
-    kern(
-        bpg, tpb,
-        (LR, HR, flow_arr,
-         np.int32(n_channels), np.int32(lny), np.int32(lnx),
-         np.int32(hny), np.int32(hnx),
-         np.int32(upscale), np.int32(is_ref), np.int32(tile_size),
-         np.int32(np_y), np.int32(np_x)),
-    )
+    LR_y = (Y + flow_y + 0.5) / s - 0.5
+    LR_x = (X + flow_x + 0.5) / s - 0.5
+    oob = ~((LR_y >= 0) & (LR_y < lny) & (LR_x >= 0) & (LR_x < lnx))
+    cy = cp.rint(LR_y).astype(cp.int32)
+    cx = cp.rint(LR_x).astype(cp.int32)
+
+    buf = cp.zeros((n_channels, hny, hnx), dtype=cp.float32)
+    w_acc = cp.zeros((hny, hnx), dtype=cp.float32)
+    for i in (-1, 0, 1):
+        y_ = cp.clip(cy + i, 0, lny - 1)
+        wy = _dogson_q(y_.astype(cp.float32) - LR_y)
+        for j in (-1, 0, 1):
+            x_ = cp.clip(cx + j, 0, lnx - 1)
+            w = wy * _dogson_q(x_.astype(cp.float32) - LR_x)
+            buf += LR[:, y_, x_] * w
+            w_acc += w
+    HR = buf / w_acc
+    HR[:, oob] = cp.inf
     return HR
 
 
@@ -367,304 +391,195 @@ def estimate_cov_cupy(full_grads, k_detail, k_denoise, D_th, D_tr,
     return covs
 
 
-# ---------------------------------------------------------------------------
-# RawModules (compiled lazily, cached)
-# ---------------------------------------------------------------------------
-_MODULES = {}
+def _interp_cov_bilinear(covs, fy_floor, fx_floor, fy_ceil, fx_ceil, frac_y, frac_x):
+    """Bilinear-interpolate the (...,2,2) cov grid and return inverse components."""
+    cov_h, cov_w = covs.shape[:2]
 
-_DOGSON_SRC = r'''
-extern "C" {
-__device__ float dogson_q(float x){
-    float ax = fabsf(x);
-    if (ax <= 0.5f) return -2.0f*ax*ax + 1.0f;
-    else if (ax <= 1.5f) return ax*ax - 2.5f*ax + 1.5f;
-    else return 0.0f;
-}
-__global__ void upscale_dogson(
-    const float* LR, float* HR, const float* flow,
-    int n_channels, int lny, int lnx, int hny, int hnx,
-    int s, int is_ref, int tile_size, int np_y, int np_x)
-{
-    int x = blockIdx.x*blockDim.x + threadIdx.x;
-    int y = blockIdx.y*blockDim.y + threadIdx.y;
-    if (x >= hnx || y >= hny) return;
+    def at(yy, xx, a, b):
+        return covs[cp.clip(yy, 0, cov_h - 1), cp.clip(xx, 0, cov_w - 1), a, b]
 
-    float flow_x = 0.0f, flow_y = 0.0f;
-    if (!is_ref){
-        int py = y / tile_size; int px = x / tile_size;
-        if (py >= np_y) py = np_y - 1;
-        if (px >= np_x) px = np_x - 1;
-        flow_x = flow[(py*np_x + px)*2 + 0];
-        flow_y = flow[(py*np_x + px)*2 + 1];
-    }
-    float LR_y = (y + flow_y + 0.5f)/s - 0.5f;
-    float LR_x = (x + flow_x + 0.5f)/s - 0.5f;
-    if (!(0.0f <= LR_y && LR_y < lny && 0.0f <= LR_x && LR_x < lnx)){
-        float inf = __int_as_float(0x7f800000);
-        for (int c=0;c<n_channels;c++) HR[(c*hny + y)*hnx + x] = inf;
-        return;
-    }
-    int center_y = (int)rintf(LR_y);
-    int center_x = (int)rintf(LR_x);
-    float w_acc = 0.0f;
-    float buf[3] = {0.0f,0.0f,0.0f};
-    for (int i=-1;i<2;i++){
-        int y_ = center_y + i; if (y_<0) y_=0; if (y_>lny-1) y_=lny-1;
-        float wy = dogson_q((float)y_ - LR_y);
-        for (int j=-1;j<2;j++){
-            int x_ = center_x + j; if (x_<0) x_=0; if (x_>lnx-1) x_=lnx-1;
-            float w = wy * dogson_q((float)x_ - LR_x);
-            for (int c=0;c<n_channels;c++) buf[c] += LR[(c*lny + y_)*lnx + x_] * w;
-            w_acc += w;
-        }
-    }
-    for (int c=0;c<n_channels;c++) HR[(c*hny + y)*hnx + x] = buf[c]/w_acc;
-}
-}
-'''
+    def lerp(a, b):
+        c00 = at(fy_floor, fx_floor, a, b)
+        c01 = at(fy_floor, fx_ceil, a, b)
+        c10 = at(fy_ceil, fx_floor, a, b)
+        c11 = at(fy_ceil, fx_ceil, a, b)
+        top = c00 + frac_x * (c01 - c00)
+        bot = c10 + frac_x * (c11 - c10)
+        return top + frac_y * (bot - top)
 
-_MERGE_SRC = r'''
-extern "C" {
-__global__ void accumulate(
-    const float* comp_img, const float* alignments, const float* covs, const float* r,
-    int bayer_mode, int iso_kernel, float scale, int tile_size, const unsigned char* CFA,
-    float* num, float* den,
-    int hr_h, int hr_w, int lr_h, int lr_w, int np_y, int np_x, int cov_h, int cov_w)
-{
-    int hr_j = blockIdx.x*blockDim.x + threadIdx.x;
-    int hr_i = blockIdx.y*blockDim.y + threadIdx.y;
-    if (hr_j >= hr_w || hr_i >= hr_h) return;
-
-    int n_channels = bayer_mode ? 3 : 1;
-    float acc[3] = {0,0,0};
-    float val[3] = {0,0,0};
-
-    float lr_x = (hr_j + 0.5f)/scale;
-    float lr_y = (hr_i + 0.5f)/scale;
-    int px = (int)(lr_x/tile_size);
-    int py = (int)(lr_y/tile_size);
-    if (px >= np_x) px = np_x-1;
-    if (py >= np_y) py = np_y-1;
-    float flowx = alignments[(py*np_x + px)*2 + 0];
-    float flowy = alignments[(py*np_x + px)*2 + 1];
-
-    int i_r = min((int)lr_y, lr_h-1);
-    int j_r = min((int)lr_x, lr_w-1);
-    float local_r = r[i_r*lr_w + j_r];
-
-    float lr_mov_x = lr_x + flowx;
-    float lr_mov_y = lr_y + flowy;
-    if (!(0.0f<=lr_mov_x && lr_mov_x<lr_w && 0.0f<=lr_mov_y && lr_mov_y<lr_h)) return;
-
-    float cov_i_xx=0, cov_i_xy=0, cov_i_yy=0;
-    if (!iso_kernel){
-        float kmap_j, kmap_i;
-        if (bayer_mode){ kmap_j = lr_mov_x/2.0f - 0.5f; kmap_i = lr_mov_y/2.0f - 0.5f; }
-        else { kmap_j = lr_mov_x - 0.5f; kmap_i = lr_mov_y - 0.5f; }
-        int ikx = (int)kmap_j; int iky = (int)kmap_i;
-        float frac_x = kmap_j - (float)ikx;
-        float frac_y = kmap_i - (float)iky;
-        int floor_x = ikx>0?ikx:0; int floor_y = iky>0?iky:0;
-        int ceil_x = min(floor_x+1, cov_w-1);
-        int ceil_y = min(floor_y+1, cov_h-1);
-        #define COV(yy,xx,a,b) covs[(((yy)*cov_w+(xx))*2 + (a))*2 + (b)]
-        float tr_xx=COV(floor_y,floor_x,0,0), tr_xy=COV(floor_y,floor_x,0,1), tr_yy=COV(floor_y,floor_x,1,1);
-        float tl_xx=COV(floor_y,ceil_x,0,0),  tl_xy=COV(floor_y,ceil_x,0,1),  tl_yy=COV(floor_y,ceil_x,1,1);
-        float br_xx=COV(ceil_y,floor_x,0,0),  br_xy=COV(ceil_y,floor_x,0,1),  br_yy=COV(ceil_y,floor_x,1,1);
-        float bl_xx=COV(ceil_y,ceil_x,0,0),   bl_xy=COV(ceil_y,ceil_x,0,1),   bl_yy=COV(ceil_y,ceil_x,1,1);
-        #undef COV
-        float top_xx=tr_xx+frac_x*(tl_xx-tr_xx), top_xy=tr_xy+frac_x*(tl_xy-tr_xy), top_yy=tr_yy+frac_x*(tl_yy-tr_yy);
-        float bot_xx=br_xx+frac_x*(bl_xx-br_xx), bot_xy=br_xy+frac_x*(bl_xy-br_xy), bot_yy=br_yy+frac_x*(bl_yy-br_yy);
-        float ixx=top_xx+frac_y*(bot_xx-top_xx), ixy=top_xy+frac_y*(bot_xy-top_xy), iyy=top_yy+frac_y*(bot_yy-top_yy);
-        float det = ixx*iyy - ixy*ixy;
-        float inv = 1.0f/det;
-        cov_i_xx =  inv*iyy; cov_i_xy = -inv*ixy; cov_i_yy = inv*ixx;
-    }
-
-    int center_j = (int)lr_mov_x;
-    int center_i = (int)lr_mov_y;
-    float lr_mov_j = lr_mov_x - 0.5f;
-    float lr_mov_i = lr_mov_y - 0.5f;
-    for (int di=-1;di<2;di++){
-        for (int dj=-1;dj<2;dj++){
-            int j = center_j + dj;
-            int i = center_i + di;
-            if (!(0<=j && j<lr_w && 0<=i && i<lr_h)) continue;
-            int channel = bayer_mode ? CFA[(i&1)*2 + (j&1)] : 0;
-            float c = comp_img[i*lr_w + j];
-            float dist_x = j - lr_mov_j;
-            float dist_y = i - lr_mov_i;
-            float z;
-            if (iso_kernel) z = 2.0f*(dist_x*dist_x + dist_y*dist_y);
-            else z = cov_i_xx*dist_x*dist_x + 2.0f*cov_i_xy*dist_x*dist_y + cov_i_yy*dist_y*dist_y;
-            if (z < 0.0f) z = 0.0f;
-            float w = expf(-0.5f*z);
-            val[channel] += w*local_r*c;
-            acc[channel] += w*local_r;
-        }
-    }
-    for (int ch=0; ch<n_channels; ch++){
-        num[(hr_i*hr_w + hr_j)*3 + ch] += val[ch];
-        den[(hr_i*hr_w + hr_j)*3 + ch] += acc[ch];
-    }
-}
-
-__global__ void accumulate_ref(
-    const float* ref_img, const float* covs,
-    int bayer_mode, int iso_kernel, float scale, const unsigned char* CFA,
-    float* num, float* den, const float* acc_rob,
-    int robustness_denoise, int max_frame_count, int rad_max, float max_multiplier,
-    int hr_h, int hr_w, int lr_h, int lr_w, int cov_h, int cov_w, int accr_h, int accr_w)
-{
-    int hr_j = blockIdx.x*blockDim.x + threadIdx.x;
-    int hr_i = blockIdx.y*blockDim.y + threadIdx.y;
-    if (hr_j >= hr_w || hr_i >= hr_h) return;
-
-    int n_channels = bayer_mode ? 3 : 1;
-    float acc[3] = {0,0,0};
-    float val[3] = {0,0,0};
-
-    float crp_y = hr_i/scale;
-    float crp_x = hr_j/scale;
-
-    float cov_i_xx=0, cov_i_xy=0, cov_i_yy=0;
-    if (!iso_kernel){
-        float gy, gx;
-        if (bayer_mode){ gy = (crp_y-0.5f)/2.0f; gx = (crp_x-0.5f)/2.0f; }
-        else { gy = crp_y; gx = crp_x; }
-        int floor_x = (int)floorf(gx); if (floor_x<0) floor_x=0;
-        int floor_y = (int)floorf(gy); if (floor_y<0) floor_y=0;
-        int ceil_x = min(floor_x+1, cov_w-1);
-        int ceil_y = min(floor_y+1, cov_h-1);
-        float fx = gx - floorf(gx);
-        float fy = gy - floorf(gy);
-        #define COV(yy,xx,a,b) covs[(((yy)*cov_w+(xx))*2 + (a))*2 + (b)]
-        float c00_xx=COV(floor_y,floor_x,0,0), c00_xy=COV(floor_y,floor_x,0,1), c00_yy=COV(floor_y,floor_x,1,1);
-        float c01_xx=COV(floor_y,ceil_x,0,0),  c01_xy=COV(floor_y,ceil_x,0,1),  c01_yy=COV(floor_y,ceil_x,1,1);
-        float c10_xx=COV(ceil_y,floor_x,0,0),  c10_xy=COV(ceil_y,floor_x,0,1),  c10_yy=COV(ceil_y,floor_x,1,1);
-        float c11_xx=COV(ceil_y,ceil_x,0,0),   c11_xy=COV(ceil_y,ceil_x,0,1),   c11_yy=COV(ceil_y,ceil_x,1,1);
-        #undef COV
-        float ixx = c00_xx*(1-fx)*(1-fy)+c01_xx*fx*(1-fy)+c10_xx*(1-fx)*fy+c11_xx*fx*fy;
-        float ixy = c00_xy*(1-fx)*(1-fy)+c01_xy*fx*(1-fy)+c10_xy*(1-fx)*fy+c11_xy*fx*fy;
-        float iyy = c00_yy*(1-fx)*(1-fy)+c01_yy*fx*(1-fy)+c10_yy*(1-fx)*fy+c11_yy*fx*fy;
-        float det = ixx*iyy - ixy*ixy;
-        float inv = (fabsf(det) > 1e-10f) ? 1.0f/det : 1.0f;
-        cov_i_xx = inv*iyy; cov_i_xy = -inv*ixy; cov_i_yy = inv*ixx;
-    }
-
-    int rad = 1;
-    float add_denoise = 1.0f;
-    float local_acc_r = 0.0f;
-    if (robustness_denoise){
-        int ir = min((int)rintf(crp_y), accr_h-1);
-        int jr = min((int)rintf(crp_x), accr_w-1);
-        local_acc_r = acc_rob[ir*accr_w + jr];
-        add_denoise = (local_acc_r <= max_frame_count) ? max_multiplier : 1.0f;
-        rad = (local_acc_r <= max_frame_count) ? rad_max : 1;
-    }
-
-    int center_x = (int)rintf(crp_x);
-    int center_y = (int)rintf(crp_y);
-    for (int i=-rad;i<rad+1;i++){
-        for (int j=-rad;j<rad+1;j++){
-            int pidx = center_x + j;
-            int pidy = center_y + i;
-            if (!(0<=pidx && pidx<lr_w && 0<=pidy && pidy<lr_h)) continue;
-            int channel = bayer_mode ? CFA[(pidy&1)*2 + (pidx&1)] : 0;
-            float c = ref_img[pidy*lr_w + pidx];
-            float dist_x = pidx - crp_x;
-            float dist_y = pidy - crp_y;
-            float y;
-            if (iso_kernel) y = 2.0f*(dist_x*dist_x + dist_y*dist_y);
-            else y = cov_i_xx*dist_x*dist_x + 2.0f*cov_i_xy*dist_x*dist_y + cov_i_yy*dist_y*dist_y;
-            if (y < 0.0f) y = 0.0f;
-            y /= add_denoise;
-            float w = expf(-0.5f*y);
-            val[channel] += c*w;
-            acc[channel] += w;
-        }
-    }
-    if (robustness_denoise && local_acc_r < max_frame_count){
-        for (int ch=0; ch<n_channels; ch++){
-            num[(hr_i*hr_w + hr_j)*3 + ch] = val[ch];
-            den[(hr_i*hr_w + hr_j)*3 + ch] = acc[ch];
-        }
-    } else {
-        for (int ch=0; ch<n_channels; ch++){
-            num[(hr_i*hr_w + hr_j)*3 + ch] += val[ch];
-            den[(hr_i*hr_w + hr_j)*3 + ch] += acc[ch];
-        }
-    }
-}
-}
-'''
-
-_MODULE_SRC = {"dogson": _DOGSON_SRC, "merge": _MERGE_SRC}
-
-
-def _get_module(name):
-    if name not in _MODULES:
-        _MODULES[name] = cp.RawModule(code=_MODULE_SRC[name], options=("--std=c++14",))
-    return _MODULES[name]
+    ixx, ixy, iyy = lerp(0, 0), lerp(0, 1), lerp(1, 1)
+    det = ixx * iyy - ixy * ixy
+    inv = 1.0 / det
+    return inv * iyy, -inv * ixy, inv * ixx
 
 
 def merge_accumulate_cupy(comp_img, alignments, covs, r, bayer_mode, iso_kernel,
                           scale, tile_size, cfa_pattern, num, den):
-    """Alg. 4 accumulation of a comparison frame into num/den (in place)."""
-    comp = cp.ascontiguousarray(cp.asarray(comp_img, dtype=cp.float32))
-    al = cp.ascontiguousarray(cp.asarray(alignments, dtype=cp.float32))
-    covs = cp.ascontiguousarray(cp.asarray(covs, dtype=cp.float32))
-    r = cp.ascontiguousarray(cp.asarray(r, dtype=cp.float32))
-    cfa = cp.ascontiguousarray(cp.asarray(cfa_pattern).astype(cp.uint8))
+    """Alg. 4 accumulation of a comparison frame into num/den (in place).
+
+    Pure CuPy: one vectorized pass per 3x3 neighbour offset (a bounded gather,
+    not a scatter), with elementwise cov interpolation / kernel weights and
+    per-Bayer-channel masked accumulation. Matches the RawKernel
+    (test/test_kernel_equivalence.py).
+    """
+    comp = cp.asarray(comp_img, dtype=cp.float32)
+    al = cp.asarray(alignments, dtype=cp.float32)
+    covs = cp.asarray(covs, dtype=cp.float32)
+    r = cp.asarray(r, dtype=cp.float32)
+    cfa = cp.asarray(cfa_pattern).astype(cp.int32)
     num = cp.asarray(num)
     den = cp.asarray(den)
-
     hr_h, hr_w, _ = num.shape
     lr_h, lr_w = comp.shape
     np_y, np_x, _ = al.shape
-    cov_h, cov_w = covs.shape[:2]
+    n_ch = 3 if bayer_mode else 1
 
-    kern = _get_module("merge").get_function("accumulate")
-    tpb = (16, 16)
-    bpg = ((hr_w + 15) // 16, (hr_h + 15) // 16)
-    kern(bpg, tpb, (
-        comp, al, covs, r,
-        np.int32(bayer_mode), np.int32(iso_kernel), np.float32(scale),
-        np.int32(tile_size), cfa, num, den,
-        np.int32(hr_h), np.int32(hr_w), np.int32(lr_h), np.int32(lr_w),
-        np.int32(np_y), np.int32(np_x), np.int32(cov_h), np.int32(cov_w),
-    ))
+    I, J = cp.meshgrid(cp.arange(hr_h, dtype=cp.float32), cp.arange(hr_w, dtype=cp.float32), indexing="ij")
+    lr_x = (J + 0.5) / scale
+    lr_y = (I + 0.5) / scale
+    px = cp.minimum((lr_x / tile_size).astype(cp.int32), np_x - 1)
+    py = cp.minimum((lr_y / tile_size).astype(cp.int32), np_y - 1)
+    flowx = al[py, px, 0]
+    flowy = al[py, px, 1]
+    local_r = r[cp.minimum(lr_y.astype(cp.int32), lr_h - 1), cp.minimum(lr_x.astype(cp.int32), lr_w - 1)]
+    lr_mov_x = lr_x + flowx
+    lr_mov_y = lr_y + flowy
+    mov_inb = (lr_mov_x >= 0) & (lr_mov_x < lr_w) & (lr_mov_y >= 0) & (lr_mov_y < lr_h)
+
+    if not iso_kernel:
+        if bayer_mode:
+            kmap_j, kmap_i = lr_mov_x / 2.0 - 0.5, lr_mov_y / 2.0 - 0.5
+        else:
+            kmap_j, kmap_i = lr_mov_x - 0.5, lr_mov_y - 0.5
+        ikx, iky = kmap_j.astype(cp.int32), kmap_i.astype(cp.int32)  # trunc toward zero
+        frac_x, frac_y = kmap_j - ikx, kmap_i - iky
+        fx_fl, fy_fl = cp.maximum(ikx, 0), cp.maximum(iky, 0)
+        cov_i_xx, cov_i_xy, cov_i_yy = _interp_cov_bilinear(
+            covs, fy_fl, fx_fl, fy_fl + 1, fx_fl + 1, frac_y, frac_x)
+
+    center_j = lr_mov_x.astype(cp.int32)
+    center_i = lr_mov_y.astype(cp.int32)
+    lr_mov_j = lr_mov_x - 0.5
+    lr_mov_i = lr_mov_y - 0.5
+    val = [cp.zeros((hr_h, hr_w), cp.float32) for _ in range(n_ch)]
+    acc = [cp.zeros((hr_h, hr_w), cp.float32) for _ in range(n_ch)]
+    for di in (-1, 0, 1):
+        for dj in (-1, 0, 1):
+            j = center_j + dj
+            i = center_i + di
+            nb = (j >= 0) & (j < lr_w) & (i >= 0) & (i < lr_h)
+            c = comp[cp.clip(i, 0, lr_h - 1), cp.clip(j, 0, lr_w - 1)]
+            dx = j.astype(cp.float32) - lr_mov_j
+            dy = i.astype(cp.float32) - lr_mov_i
+            if iso_kernel:
+                z = 2.0 * (dx * dx + dy * dy)
+            else:
+                z = cov_i_xx * dx * dx + 2.0 * cov_i_xy * dx * dy + cov_i_yy * dy * dy
+            w = cp.exp(-0.5 * cp.maximum(z, 0.0))
+            wv = w * local_r * c * nb
+            wa = w * local_r * nb
+            if bayer_mode:
+                chan = cfa[i & 1, j & 1]
+                for ch in range(3):
+                    m = chan == ch
+                    val[ch] += wv * m
+                    acc[ch] += wa * m
+            else:
+                val[0] += wv
+                acc[0] += wa
+    for ch in range(n_ch):
+        num[..., ch] += val[ch] * mov_inb
+        den[..., ch] += acc[ch] * mov_inb
     return num, den
 
 
 def merge_ref_accumulate_cupy(ref_img, covs, bayer_mode, iso_kernel, scale,
                               cfa_pattern, num, den, acc_rob,
                               robustness_denoise, max_frame_count, rad_max, max_multiplier):
-    """Alg. 11 accumulation of the reference frame into num/den (in place)."""
-    ref = cp.ascontiguousarray(cp.asarray(ref_img, dtype=cp.float32))
-    covs = cp.ascontiguousarray(cp.asarray(covs, dtype=cp.float32))
-    cfa = cp.ascontiguousarray(cp.asarray(cfa_pattern).astype(cp.uint8))
+    """Alg. 11 accumulation of the reference frame into num/den (in place).
+
+    Pure CuPy, mirroring the RawKernel: flow=0, the coarse position is hr/scale
+    (no +0.5), the cov grid is sampled with floor (not truncation), and the
+    optional robustness-aware denoiser varies the radius/blur per pixel and may
+    overwrite (single-frame mode). Matches the RawKernel
+    (test/test_kernel_equivalence.py).
+    """
+    ref = cp.asarray(ref_img, dtype=cp.float32)
+    covs = cp.asarray(covs, dtype=cp.float32)
+    cfa = cp.asarray(cfa_pattern).astype(cp.int32)
     num = cp.asarray(num)
     den = cp.asarray(den)
-    if acc_rob is None:
-        acc_rob = cp.zeros((1, 1), dtype=cp.float32)
-    acc_rob = cp.ascontiguousarray(cp.asarray(acc_rob, dtype=cp.float32))
-
     hr_h, hr_w, _ = num.shape
     lr_h, lr_w = ref.shape
-    cov_h, cov_w = covs.shape[:2]
-    accr_h, accr_w = acc_rob.shape
+    n_ch = 3 if bayer_mode else 1
 
-    kern = _get_module("merge").get_function("accumulate_ref")
-    tpb = (16, 16)
-    bpg = ((hr_w + 15) // 16, (hr_h + 15) // 16)
-    kern(bpg, tpb, (
-        ref, covs,
-        np.int32(bayer_mode), np.int32(iso_kernel), np.float32(scale), cfa,
-        num, den, acc_rob,
-        np.int32(robustness_denoise), np.int32(max_frame_count), np.int32(rad_max),
-        np.float32(max_multiplier),
-        np.int32(hr_h), np.int32(hr_w), np.int32(lr_h), np.int32(lr_w),
-        np.int32(cov_h), np.int32(cov_w), np.int32(accr_h), np.int32(accr_w),
-    ))
+    I, J = cp.meshgrid(cp.arange(hr_h, dtype=cp.float32), cp.arange(hr_w, dtype=cp.float32), indexing="ij")
+    crp_y = I / scale
+    crp_x = J / scale
+
+    if not iso_kernel:
+        if bayer_mode:
+            gy, gx = (crp_y - 0.5) / 2.0, (crp_x - 0.5) / 2.0
+        else:
+            gy, gx = crp_y, crp_x
+        floor_y = cp.maximum(cp.floor(gy).astype(cp.int32), 0)
+        floor_x = cp.maximum(cp.floor(gx).astype(cp.int32), 0)
+        fy = gy - cp.floor(gy)
+        fx = gx - cp.floor(gx)
+        cov_i_xx, cov_i_xy, cov_i_yy = _interp_cov_bilinear(
+            covs, floor_y, floor_x, floor_y + 1, floor_x + 1, fy, fx)
+
+    if robustness_denoise:
+        acc_rob = cp.asarray(acc_rob if acc_rob is not None else cp.zeros((1, 1)), dtype=cp.float32)
+        ah, aw = acc_rob.shape
+        ir = cp.minimum(cp.rint(crp_y).astype(cp.int32), ah - 1)
+        jr = cp.minimum(cp.rint(crp_x).astype(cp.int32), aw - 1)
+        local_acc_r = acc_rob[cp.clip(ir, 0, ah - 1), cp.clip(jr, 0, aw - 1)]
+        cond = local_acc_r <= max_frame_count
+        add_denoise = cp.where(cond, cp.float32(max_multiplier), cp.float32(1.0))
+        rad_pix = cp.where(cond, int(rad_max), 1)
+        rad_loop = max(int(rad_max), 1)
+    else:
+        add_denoise = cp.float32(1.0)
+        rad_pix = None
+        rad_loop = 1
+
+    center_x = cp.rint(crp_x).astype(cp.int32)
+    center_y = cp.rint(crp_y).astype(cp.int32)
+    val = [cp.zeros((hr_h, hr_w), cp.float32) for _ in range(n_ch)]
+    acc = [cp.zeros((hr_h, hr_w), cp.float32) for _ in range(n_ch)]
+    for di in range(-rad_loop, rad_loop + 1):
+        for dj in range(-rad_loop, rad_loop + 1):
+            pidx = center_x + dj
+            pidy = center_y + di
+            nb = (pidx >= 0) & (pidx < lr_w) & (pidy >= 0) & (pidy < lr_h)
+            if rad_pix is not None:
+                nb = nb & (abs(di) <= rad_pix) & (abs(dj) <= rad_pix)
+            c = ref[cp.clip(pidy, 0, lr_h - 1), cp.clip(pidx, 0, lr_w - 1)]
+            dx = pidx.astype(cp.float32) - crp_x
+            dy = pidy.astype(cp.float32) - crp_y
+            if iso_kernel:
+                y = 2.0 * (dx * dx + dy * dy)
+            else:
+                y = cov_i_xx * dx * dx + 2.0 * cov_i_xy * dx * dy + cov_i_yy * dy * dy
+            w = cp.exp(-0.5 * (cp.maximum(y, 0.0) / add_denoise))
+            if bayer_mode:
+                chan = cfa[pidy & 1, pidx & 1]
+                for ch in range(3):
+                    m = chan == ch
+                    val[ch] += c * w * nb * m
+                    acc[ch] += w * nb * m
+            else:
+                val[0] += c * w * nb
+                acc[0] += w * nb
+
+    if robustness_denoise:
+        overwrite = local_acc_r < max_frame_count
+        for ch in range(n_ch):
+            num[..., ch] = cp.where(overwrite, val[ch], num[..., ch] + val[ch])
+            den[..., ch] = cp.where(overwrite, acc[ch], den[..., ch] + acc[ch])
+    else:
+        for ch in range(n_ch):
+            num[..., ch] += val[ch]
+            den[..., ch] += acc[ch]
     return num, den

@@ -9,19 +9,6 @@ from .utils import clamp, DEFAULT_NUMPY_FLOAT_TYPE, DEFAULT_CUDA_FLOAT_TYPE, DEF
 from .cupy_ops import block_matching_l1_cupy, to_torch
 FLOAT = DEFAULT_NUMPY_FLOAT_TYPE
 
-# Cached ones kernels for the windowed L2 norm in L2 block matching. Generalized
-# to ANY tile size (was hard-coded to {8,16,32,64}, which forced patch size into
-# that set and broke tile_sizes whose last level was e.g. 4).
-_BOX_FILTERS = {}
-
-
-def _box_filter(tile_size):
-    if tile_size not in _BOX_FILTERS:
-        bf = torch.ones((1, 1, tile_size, tile_size),
-                        dtype=DEFAULT_TORCH_FLOAT_TYPE, device="cuda")
-        bf.requires_grad = False
-        _BOX_FILTERS[tile_size] = bf
-    return _BOX_FILTERS[tile_size]
 
 def align_lvl_block_matching_L2(tyled_pyr_lvl, ref_fft_lvl, moving_lvl, alignment, l, config):
     verbose = config.verbose > 2
@@ -50,12 +37,12 @@ def align_lvl_block_matching_L2(tyled_pyr_lvl, ref_fft_lvl, moving_lvl, alignmen
     corrs = corrs[..., crop+1:crop+corr_size+1, crop+1:crop+corr_size+1]
 
 
-    ## Now compute the windows L2 norm of the search patches
-    box_filter = _box_filter(tileSize)
-
-    # TODO there may be a faster and smarter way than conv2d for this, but this is not the bottleneck so far
-    L2_search = torch.nn.functional.conv2d(
-        search_area.view(-1, 1, search_size, search_size).square(), box_filter, padding="valid")
+    ## Windowed L2 norm of the search patches = a box filter (windowed sum of
+    ## squares). avg_pool2d (stride 1, valid) * tileSize^2 is the torch library
+    ## primitive for it -- any tile size, separable, faster than a t x t ones
+    ## conv. (CuPy analogue: cupyx.scipy.ndimage.uniform_filter * tileSize^2.)
+    sq = search_area.view(-1, 1, search_size, search_size).square()
+    L2_search = torch.nn.functional.avg_pool2d(sq, tileSize, stride=1) * (tileSize * tileSize)
     L2_search = L2_search.view(search_area.shape[0], search_area.shape[1], L2_search.shape[-2], L2_search.shape[-1])
 
     ## Final L2 error computation (Not the full L2, but enough to find the minimum)
