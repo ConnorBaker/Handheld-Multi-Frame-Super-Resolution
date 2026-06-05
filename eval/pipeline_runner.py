@@ -32,6 +32,24 @@ _CFA_STR = {(0, 1, 1, 2): "RGGB", (2, 1, 1, 0): "BGGR",
             (1, 0, 2, 1): "GRBG", (1, 2, 0, 1): "GBRG"}
 
 
+def _to_rgb(arr):
+    """Finalize a merged frame to display RGB: fill NaN with 0, then clip to [0, 1].
+
+    Where the NaN comes from (it is understood, not a method bug): the merge
+    divides accumulated num by den, and den == 0 wherever the steerable-kernel
+    scatter deposited no weight -> 0/0. The MULTI-frame merge (``run``) is
+    NaN-free: sub-pixel frame diversity covers every output-grid cell, so den > 0
+    everywhere (guarded by ``test_multiframe_raw_output_has_no_nan``, which checks
+    ``main`` directly, before this fill). The fill is load-bearing ONLY for the
+    coverage-starved ``run_single`` baseline at scale > 1: one frame cannot cover a
+    finer grid, leaving the outer 1-px border of the sparser Bayer channels (R, B;
+    G is 2x denser and stays covered) at den == 0. Those border pixels are excluded
+    from every metric (interior crop), so zero-filling them is the right baseline
+    behavior. ``np.clip`` alone would NOT remove the NaN (clip passes NaN through).
+    """
+    return np.clip(np.nan_to_num(arr), 0, 1)
+
+
 def load_burst(burst_path):
     """Decode a DNG burst once. Returns a dict reusable across many configs."""
     ref_raw, raw_comp, ISO, tags, CFA, xyz2cam, wb, ref_path = load_dng_burst(burst_path)
@@ -81,7 +99,7 @@ def run(burst, overrides=None, n_frames=None):
     cfg = build_config(burst, overrides)
     comp = burst["raw_comp"] if n_frames is None else burst["raw_comp"][:n_frames]
     num, _ = main(burst["ref_raw"], comp, cfg)
-    return np.clip(np.nan_to_num(cp.asnumpy(num)), 0, 1), cfg
+    return _to_rgb(cp.asnumpy(num)), cfg
 
 
 def run_single(burst, overrides=None):
@@ -95,13 +113,13 @@ def run_single(burst, overrides=None):
     den = cp.zeros((H, W, 3), cp.float32)
     merge_ref(cref, covs, num, den, cfa, cfg)
     divide(num, den)
-    return np.clip(np.nan_to_num(cp.asnumpy(num)), 0, 1), cfg
+    return _to_rgb(cp.asnumpy(num)), cfg
 
 
 def run_bilinear(burst):
     """Naive bilinear demosaic of the reference frame (sanity baseline)."""
     img = _bilinear(burst["ref_raw"], burst["cfa_str"]).astype(np.float32)
-    return np.clip(np.nan_to_num(img), 0, 1)
+    return _to_rgb(img)
 
 
 def postprocess(burst, linear_rgb, cfg, do_sharpening=None):
@@ -120,4 +138,4 @@ def postprocess(burst, linear_rgb, cfg, do_sharpening=None):
             cfg.postprocessing.do_devignetting, burst["xyz2cam"],
             deblur_config=cfg.postprocessing.get("deblur", None),
             aberration_config=cfg.postprocessing.get("aberration", None))
-    return np.clip(np.nan_to_num(out), 0, 1)
+    return _to_rgb(out)

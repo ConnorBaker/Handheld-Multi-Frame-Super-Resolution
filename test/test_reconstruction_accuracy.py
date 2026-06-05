@@ -34,6 +34,7 @@ mean ~0.012, p99 ~0.044.
 """
 
 import numpy as np
+import cupy as cp
 import cv2
 import pytest
 from scipy.ndimage import gaussian_filter
@@ -42,6 +43,7 @@ from skimage.metrics import peak_signal_noise_ratio as _psnr
 # Reuse the eval harness: same forward model + same ready-made baselines.
 from eval.synthetic import make_synthetic_burst
 from eval import pipeline_runner as pr
+from handheld_super_resolution.super_resolution import main
 
 # --- synthetic-GT / forward-model parameters (fixed; keep the test fast) ---
 _GT_SIZE = 1024          # GT side; LR = 512 (the coarsest pyramid level needs this)
@@ -188,9 +190,41 @@ def test_multiframe_beats_single_and_bilinear(reconstruction, capsys):
 
 
 def test_multiframe_output_well_formed(reconstruction):
-    """Output is finite, in-gamut and at the super-resolved shape."""
+    """Output is in-gamut and at the super-resolved shape.
+
+    (The finiteness of ``out`` here is weak -- ``pr.run`` applies ``nan_to_num`` --
+    so the real NaN guard is ``test_multiframe_raw_output_has_no_nan`` below, which
+    checks ``main`` directly, before any masking.)
+    """
     r = reconstruction
     out, gt = r["out"], r["gt"]
     assert out.shape == gt.shape == (_GT_SIZE, _GT_SIZE, 3)
     assert np.isfinite(out).all()
     assert 0.0 <= out.min() and out.max() <= 1.0
+
+
+def test_multiframe_raw_output_has_no_nan():
+    """The multi-frame merge emits a finite raw output WITHOUT any NaN masking.
+
+    This is the *non-vacuous* guard for the product's NaN-freeness. ``pr.run``
+    applies ``np.nan_to_num`` (load-bearing only for the single-frame baseline's
+    uncovered border -- see ``pipeline_runner._to_rgb``), which would silently mask
+    a genuine multi-frame regression. Here we call ``main`` directly and assert the
+    raw num/den output is finite: the multi-frame merge is NaN-free because
+    sub-pixel frame diversity covers every output-grid cell (den > 0 everywhere),
+    so a regression that breaks the merge accumulation (leaving den == 0) surfaces
+    here instead of being zero-filled. Verified: a single frame super-resolved at
+    this scale leaves 2048 border pixels (R/B channels) at den == 0 -> NaN, while
+    the full burst leaves none.
+    """
+    gt = _ground_truth()
+    burst, _gt, _shifts = make_synthetic_burst(
+        gt, n=_N_FRAMES, factor=_FACTOR, alpha=_ALPHA, seed=_SEED)
+    cfg = pr.build_config(burst, {"scale": _FACTOR})
+    num, _ = main(burst["ref_raw"], burst["raw_comp"], cfg)
+    raw = cp.asnumpy(num)
+    n_bad = int((~np.isfinite(raw)).sum())
+    assert n_bad == 0, (
+        f"{n_bad} non-finite values in the RAW multi-frame output (before "
+        f"nan_to_num) -- the merge accumulation left den == 0 somewhere; the "
+        f"multi-frame path must be NaN-free without masking")
