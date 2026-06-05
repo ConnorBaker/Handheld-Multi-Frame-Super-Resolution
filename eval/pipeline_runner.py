@@ -117,5 +117,6 @@ def postprocess(burst, linear_rgb, cfg, do_sharpening=None):
             raw, linear_rgb.astype(np.float32),
             cfg.postprocessing.do_color_correction, cfg.postprocessing.do_tonemapping,
             cfg.postprocessing.do_gamma_correction, sh,
-            cfg.postprocessing.do_devignetting, burst["xyz2cam"])
+            cfg.postprocessing.do_devignetting, burst["xyz2cam"],
+            deblur_config=cfg.postprocessing.get("deblur", None))
     return np.clip(np.nan_to_num(out), 0, 1)

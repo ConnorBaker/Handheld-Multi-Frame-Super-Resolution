@@ -209,8 +209,36 @@ def devignette(image):
     image_out = (2 - np.cos(vignette_filter)**4)[:,:,None] * image 
     return image_out
 
-def postprocess(raw, img=None, do_color_correction=True, do_tonemapping=True, 
-                do_gamma=True, sharpening_config=None, do_devignette=False, xyz2cam=None):
+def _deblur(img, deblur_config):
+    """Polyblur blind deblurring of a linear-RGB image (numpy HWC in [0, 1]).
+
+    Replaces the unsharp mask when enabled: Polyblur estimates a small
+    anisotropic-Gaussian blur and inverts it with a polynomial of the blur
+    operator (no iterative deconvolution), targeting exactly the ~1px optical /
+    kernel-regression softness. Runs on the GPU via ``torch.fft`` and returns
+    numpy HWC. See the vendored ``polyblur`` package (MIT, teboli/polyblur).
+    """
+    import torch
+    from .polyblur import polyblur_deblurring
+
+    t = torch.as_tensor(np.ascontiguousarray(img), dtype=torch.float32, device="cuda")
+    t = t.permute(2, 0, 1).unsqueeze(0).clamp(0.0, 1.0)  # (1, 3, H, W)
+    out = polyblur_deblurring(
+        t,
+        n_iter=int(deblur_config.get("n_iter", 1)),
+        alpha=float(deblur_config.get("alpha", 2)),
+        beta=float(deblur_config.get("beta", 3)),
+        remove_halo=bool(deblur_config.get("remove_halo", True)),
+        prefiltering=bool(deblur_config.get("prefiltering", True)),
+        edgetaping=bool(deblur_config.get("edgetaping", True)),
+        method="fft",
+    )
+    return out.squeeze(0).permute(1, 2, 0).contiguous().cpu().numpy()
+
+
+def postprocess(raw, img=None, do_color_correction=True, do_tonemapping=True,
+                do_gamma=True, sharpening_config=None, do_devignette=False, xyz2cam=None,
+                deblur_config=None):
     """
     Convert a raw image to jpg image.
     """
@@ -225,8 +253,10 @@ def postprocess(raw, img=None, do_color_correction=True, do_tonemapping=True,
             cam2rgb = np.linalg.inv(rgb2cam)
             img = apply_ccm(img, cam2rgb)
             img = np.clip(img, 0.0, 1.0)
-        ## Sharpening
-        if sharpening_config is not None and sharpening_config.enabled:
+        ## Deblur (Polyblur) or sharpen -- mutually exclusive; deblur takes precedence
+        if deblur_config is not None and deblur_config.enabled:
+            img = _deblur(img, deblur_config)
+        elif sharpening_config is not None and sharpening_config.enabled:
             if "radius" in sharpening_config and "amount" in sharpening_config:
                 img = filters.unsharp_mask(img, radius=sharpening_config.radius,
                                            amount=sharpening_config.amount,

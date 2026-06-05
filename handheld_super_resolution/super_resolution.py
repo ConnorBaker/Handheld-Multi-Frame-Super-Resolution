@@ -330,7 +330,8 @@ def process(burst_path, config):
                                            config.postprocessing.sharpening,
                                            config.postprocessing.do_devignetting,
                                            xyz2cam,
-                                           ) 
+                                           deblur_config=config.postprocessing.get("deblur", None),
+                                           )
     else:
         output_image = cp.asnumpy(handheld_output)
 
