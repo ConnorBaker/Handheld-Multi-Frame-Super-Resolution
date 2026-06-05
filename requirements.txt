@@ -11,3 +11,4 @@ imageio
 matplotlib
 tqdm
 pytest
+hypothesis

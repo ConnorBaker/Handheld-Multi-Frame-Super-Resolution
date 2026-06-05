@@ -56,6 +56,15 @@ def _corr(a, b):
     return float(np.corrcoef(a, b)[0, 1])
 
 
+def _abs_error(a, b):
+    """Interior (mean, max) absolute error -- a per-pixel check that, unlike
+    correlation, is NOT invariant to scale/offset, so a constant or rescaled
+    image cannot pass it."""
+    s = slice(20, -20)
+    e = np.abs(a[s, s].astype(np.float64) - b[s, s].astype(np.float64))
+    return float(e.mean()), float(e.max())
+
+
 @pytest.mark.parametrize("kernel", ["steerable", "iso"])
 @pytest.mark.parametrize("robustness", [True, False])
 def test_pipeline_reconstructs_scene(kernel, robustness):
@@ -68,7 +77,16 @@ def test_pipeline_reconstructs_scene(kernel, robustness):
     out = cp.asnumpy(num)
     assert out.shape == (H, W, 3)
     assert np.isfinite(out).all()
-    assert _corr(out.mean(axis=2), ref) > 0.99
+    luma = out.mean(axis=2)
+    assert _corr(luma, ref) > 0.99
+    # Per-pixel reconstruction accuracy (the output luma is on the same [0.05,0.5]
+    # scale as the reference scene).  Unlike the correlation above this is NOT
+    # gameable by a rescaled/constant image.  Empirical (this scale-1 smooth-scene
+    # burst is deterministic across runs/processes): observed MAE ~0.0014-0.0017,
+    # max abs error ~0.011 (steerable) / ~0.010 (iso); thresholds carry margin.
+    mae, max_ae = _abs_error(luma, ref)
+    assert mae < 0.01, f"interior MAE {mae:.4f} too high (observed <= 0.0017)"
+    assert max_ae < 0.05, f"interior max abs error {max_ae:.4f} too high (observed <= 0.011)"
 
 
 def test_pipeline_super_resolution_x2():
