@@ -89,6 +89,26 @@ def test_pipeline_reconstructs_scene(kernel, robustness):
     assert max_ae < 0.05, f"interior max abs error {max_ae:.4f} too high (observed <= 0.011)"
 
 
+def test_pipeline_robustness_off_with_save_mask_does_not_crash():
+    """Regression: robustness disabled while save_mask stays at its True default.
+
+    sanitize_config rejects this combo, but eval.pipeline_runner.build_config
+    applies overrides AFTER sanitizing, so main() can still receive it -- and it
+    used to crash dereferencing the None ref_local_means that init_robustness
+    returns when robustness is off. main() now gates mask accumulation on
+    robustness.enabled and runs with the all-ones accept-all mask instead.
+    """
+    ref = _scene()
+    comps = np.stack([_shift(ref, 0.7, -0.4), _shift(ref, -1.3, 0.8)])
+    cfg = _config()                      # valid + sanitized: robustness on, save_mask on
+    cfg.robustness.enabled = False       # post-sanitize override, exactly as the eval harness does
+    assert cfg.robustness.save_mask is True, "this test must exercise the off + save_mask combo"
+    num, _ = main(ref, comps, cfg)       # must not raise
+    out = cp.asnumpy(num)
+    assert out.shape == (H, W, 3)
+    assert np.isfinite(out).all()
+
+
 def test_pipeline_super_resolution_x2():
     ref = _scene()
     comps = np.stack([_shift(ref, 0.7, -0.4), _shift(ref, -1.3, 0.8), _shift(ref, 0.2, 1.1)])

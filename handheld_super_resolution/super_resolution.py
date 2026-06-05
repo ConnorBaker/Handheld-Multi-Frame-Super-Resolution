@@ -84,7 +84,13 @@ def main(ref_img, comp_imgs, config):
     debug_dict = {"robustness":[],
                   "flow":[]}
 
-    accumulate_r = config.accumulated_robustness_denoiser.enabled or config.robustness.save_mask
+    # Accumulating the robustness mask is only meaningful when robustness is
+    # actually computed. With robustness disabled, init_robustness returns
+    # (None, None) and compute_robustness returns an all-ones (accept-all)
+    # mask, so there is nothing to accumulate -- gate on robustness.enabled to
+    # avoid dereferencing the None ref_local_means below.
+    accumulate_r = config.robustness.enabled and (
+        config.accumulated_robustness_denoiser.enabled or config.robustness.save_mask)
 
     #### Moving to GPU
     cuda_ref_img = cuda.to_device(ref_img)
