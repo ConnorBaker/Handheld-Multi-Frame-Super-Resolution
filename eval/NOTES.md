@@ -185,6 +185,39 @@ source and forward model).
   robustness is weak when moving content shares color statistics; `robustness.t`
   is the lever (fidelity sweep chose 0.31 vs default 0.12).
 
+### CuPy primitives the size-generalizations could use (researched vs docs + cupy 14.1.1)
+
+Verified against the CuPy docs and the installed build:
+- `cupyx.scipy.ndimage`: `uniform_filter(+1d)`, `minimum_/maximum_filter`,
+  `median_filter`, `gaussian_filter`, `correlate/convolve(+1d)`, `sobel/prewitt`,
+  `generic_filter`; `map_coordinates`, `affine_transform` (has an `opencv` mode),
+  `spline_filter`, `zoom`, `shift`, `rotate`.
+- `cupyx.scipy.signal`: `convolve/correlate`, `fftconvolve`, `oaconvolve`,
+  `convolve2d/correlate2d`, `sepfir2d` (ODD-length symmetric FIR only — errors on
+  even widths, so NOT usable for an even box filter), `choose_conv_method`.
+- `cupy.lib.stride_tricks`: `as_strided`, `sliding_window_view`.
+- scatter: `cupyx.scatter_add` / `cupy.ndarray.scatter_add` / `cp.add.at`
+  (atomicAdd, float32; == `np.add.at`).
+- custom: `RawKernel`, `RawModule`, `ElementwiseKernel`, `ReductionKernel`.
+- NOT in CuPy core (would need cumsum, or cucim which is not installed):
+  integral image / summed-area table, template matching / NCC, `block_reduce`.
+
+Corrected recommendations (verified):
+- **Box filter** → `uniform_filter(x², t, mode='constant')*t²` (VERIFIED == the
+  torch valid ones-conv on the interior), or a separable pair of 1-D ones-convs
+  (6x faster than the 2-D conv). `sepfir2d` does NOT work (odd-only). No built-in
+  integral image. Current 2-D `torch.ones` conv is correct but the least
+  idiomatic/fastest expression.
+- **L1 integer-shift sampling** → padded slicing (cupy core) or
+  `sliding_window_view`; `map_coordinates` is unnecessary for integer shifts
+  (verified bit-identical to slicing).
+- **Merge** is a bounded 3x3 GATHER (1 thread/output) — earlier "needs a custom
+  kernel" was too strong. It is expressible with cupy primitives (per-offset
+  fancy-index/`map_coordinates` gather + elementwise weight + per-channel masked
+  add, or `cupyx.scatter_add`). The RawKernel is an optimization, not a necessity.
+- **Reshape+sum tile reductions / `map_coordinates(order=1)` sub-pixel warp /
+  closed-form 2x2** are already idiomatic cupy — keep (no `block_reduce` in core).
+
 ### Net correction to earlier claims
 - Pipeline + port: **correct** (multi-frame SR beats baselines vs true GT across
   forward models). Earlier real-data "multi < single" was over-denoising clean
