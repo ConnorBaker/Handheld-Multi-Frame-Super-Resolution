@@ -107,9 +107,6 @@ class AberrationCorrection(nn.Module):
             ckpt = os.path.join(checkpoint_dir, model_type + '_epoch_1000.pt')
             self.defringer.load_state_dict(torch.load(ckpt, map_location='cpu', weights_only=True))
         self.defringer.eval()
-        # Precompute polyblur theta arrays (registered as buffers so .to() moves them)
-        self.register_buffer('thetas', torch.linspace(0, 180, 7).unsqueeze(0).long())
-        self.register_buffer('interp_thetas', torch.arange(0, 180, 6).unsqueeze(0).long())
 
     @torch.no_grad()
     def forward(self, image, c=0.416, sigma_b=0.358, q=0.0, alpha=6.0, b=1.0,
@@ -136,9 +133,6 @@ class AberrationCorrection(nn.Module):
         patches = F.unfold(img_p, kernel_size=ps, stride=stride)  # (1, 3*ps*ps, L)
         L = patches.shape[-1]
         patches = patches.permute(0, 2, 1).reshape(L, 3, ps, ps)  # (L,3,ps,ps)
-
-        thetas = self.thetas.to(device)
-        interp = self.interp_thetas.to(device)
 
         out_patches = torch.empty_like(patches)
         bs = self.batch_size

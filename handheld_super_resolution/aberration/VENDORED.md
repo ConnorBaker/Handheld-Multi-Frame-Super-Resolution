@@ -6,18 +6,23 @@ Eboli, ECCV 2022) at commit `fbe8e24097900e15d8ce2a165cc9e9958708805e`. See LICE
 
 What's vendored and why:
 - `basicblock.py` — KAIR building blocks for the ResUNet defringer (torch-only).
-  **Trimmed** to only the 9 blocks the ResUNet transitively constructs
-  (`sequential`, `conv`, `ResBlock`, the three `downsample_*` and three
-  `upsample_*` factories); upstream ships ~23 (the other 14 — strideconv/ESA/
-  attention variants, `IMDBlock`, etc. — are never referenced by this checkpoint).
-  Verified bit-identical: loads the checkpoint strict and the forward output is
-  unchanged (max-abs diff 0.0).
+  **Trimmed** to only the 9 blocks the (verbatim) `ResUNet` constructor references:
+  `sequential`, `conv`, `ResBlock`, and the three `downsample_*` + three
+  `upsample_*` factories it selects between via its `downsample_mode` /
+  `upsample_mode` dispatch. This checkpoint only ever constructs `strideconv` +
+  `convtranspose`; the other four factories are kept so the constructor stays
+  verbatim (removing them would mean editing the learned model). Upstream ships
+  ~23 blocks — the ~14 dropped (ESA / channel-attention / RCAB / `IMDBlock` and
+  the other advanced blocks) are never referenced. Verified bit-identical: loads
+  the checkpoint strict and the forward output is unchanged (max-abs diff 0.0).
 - `model.py` — the `ResUNet` defringer (verbatim from upstream `modules.py`) +
   `AberrationCorrection`, an adaptation of upstream `OpticsCorrection` that
   (a) REUSES our vendored Polyblur for the per-tile blur estimation + polynomial
   inverse (upstream's `polyblur_functions.py` is an older duplicate of it), and
   (b) REPLACES `kornia.contrib` tiling with `torch.nn.functional.unfold`/`fold`
-  (verified identity round-trip < 1e-5) — so **no kornia dependency**.
+  (verified identity round-trip < 1e-5) — so **no kornia dependency**. Dropped two
+  vestigial `thetas`/`interp_thetas` buffers the adaptation never read (the per-tile
+  `polyblur_deblurring` computes its own angle grid internally).
 - `checkpoints/super_tiny_epoch_1000.pt` — the defringer weights (647 KB, 0.16M
   params; loads strict). Upstream also ships a larger `tiny` (2.3 MB); super_tiny
   defringed real images at least as well and is smaller, so only it is vendored.
