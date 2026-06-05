@@ -1,8 +1,6 @@
-import numpy as np
 import torch
 import torch.fft
 import torch.nn.functional as F
-from skimage import img_as_float32
 
 
 def to_tensor(x, to_type=torch.float):
@@ -31,20 +29,6 @@ def to_array(x):
         return x.numpy()
     
     
-def to_float(img):
-    """Converts an ndarray to np.float32 type."""
-    img = img_as_float32(img)
-    img = img.astype(np.float32)
-    return img
-
-
-def to_uint(img):
-    """Converts an ndarray to np.uint8 type."""
-    img = img_as_float32(img)
-    img = (255*img).astype(np.uint8)
-    return img
-
-
 def pad_with_kernel(img, kernel=None, ksize=3, mode='replicate'):
     if kernel is not None:
         ks = kernel.shape[-1] // 2

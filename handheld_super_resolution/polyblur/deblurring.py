@@ -98,9 +98,9 @@ def edge_aware_filtering(img, sigma_s, sigma_r):
     return img_smoothed, img_noise
 
 
-def compute_polynomial_fft(img, kernel, alpha, b, not_symmetric=False):
+def compute_polynomial_fft(img, kernel, alpha, b):
     """
-    Implements in the fourier domain the polynomial deconvolution filter (Deconvolution Alg.4) 
+    Implements in the fourier domain the polynomial deconvolution filter (Deconvolution Alg.4)
     using the polynomial approximation of Eq. (27)
     :param Y: (B,C,H,W) torch.tensor, the blurry image(s)
     :param K: (B,C,h,w)  or (B,1,h,w) torch.tensor, the blur kernel(s)
@@ -112,12 +112,8 @@ def compute_polynomial_fft(img, kernel, alpha, b, not_symmetric=False):
     h, w = img.shape[-2:]
     Y = torch.fft.fft2(img, dim=(-2, -1))
     K = filters.p2o(kernel, (h, w))  # from NxCxhxw to NxCxHxW
-    ## If the filter is not symmetric, shift the image
-    if not_symmetric:
-        C = torch.conj(K) / (torch.abs(K) + 1e-8)
-        Y = C * Y
-    ## C implements the pure phase filter described in the Polyblur article 
-    ## needed to deblur non symmetic kernels. For Gaussian kernels (symmetric) it has no effect.
+    ## (kernels here are symmetric Gaussians; upstream's non-symmetric phase-filter
+    ## branch conj(K)/|K| has no effect on them and was removed.)
     a3 = alpha / 2 - b + 2
     a2 = 3 * b - alpha - 6
     a1 = 5 - 3 * b + alpha / 2

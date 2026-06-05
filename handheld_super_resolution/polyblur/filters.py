@@ -42,33 +42,23 @@ def bilateral_filter(I, ksize=5, sigma_spatial=5.0, sigma_color=0.1):
     return bilateral_filter_loop_(I, I_padded, gw, var2_color)
 
 
-def bilateral_filter_loop_(I, I_padded, gw, var2, do_for=True):
+def bilateral_filter_loop_(I, I_padded, gw, var2):
     b, c, h, w = I.shape
-
-    if do_for:  # memory-friendly option (Recommanded for larger images)
-        J = torch.zeros_like(I)
-        W = torch.zeros_like(I)
-        for y in range(gw.shape[0]):
-            yy = y + h
-            # get the shifted image
-            I_shifted = I_padded[..., y:yy, :]
-            I_shifted = utils.extract_tiles(I_shifted, kernel_size=(h,w), stride=1)  # (B,ksize,C,H,W)
-            # color weight
-            F = I_shifted - I.unsqueeze(1)  # (B,ksize,C,H,W)
-            F = torch.exp(-F * F / var2) 
-            # product with spatial weight
-            F *= gw[y].view(-1, 1, 1, 1) # (B,ksize,C,H,W)
-            J += torch.sum(F * I_shifted, dim=1)
-            W += torch.sum(F, dim=1)
-    else:  # pytorch-friendly option (Faster for smaller images and/or batch sizes)
-        # get shifted images
-        I_shifted = utils.extract_tiles(I_padded, kernel_size=(h,w), stride=1)  # (B,ksize*ksize,C,H,W)
-        F = I_shifted - I.unsqueeze(1)
-        F = torch.exp( - F * F / var2)  # (B,ksize*ksize,C,H,W)
-        # product with spatial weights
-        F *= gw.view(-1, 1, 1, 1)
-        J = torch.sum(F * I_shifted, dim=1)  # (B,C,H,W)
-        W = torch.sum(F, dim=1)  # (B,C,H,W)
+    # memory-friendly: shift the padded image one row at a time and accumulate
+    J = torch.zeros_like(I)
+    W = torch.zeros_like(I)
+    for y in range(gw.shape[0]):
+        yy = y + h
+        # get the shifted image
+        I_shifted = I_padded[..., y:yy, :]
+        I_shifted = utils.extract_tiles(I_shifted, kernel_size=(h,w), stride=1)  # (B,ksize,C,H,W)
+        # color weight
+        F = I_shifted - I.unsqueeze(1)  # (B,ksize,C,H,W)
+        F = torch.exp(-F * F / var2)
+        # product with spatial weight
+        F *= gw[y].view(-1, 1, 1, 1) # (B,ksize,C,H,W)
+        J += torch.sum(F * I_shifted, dim=1)
+        W += torch.sum(F, dim=1)
     return J / (W + 1e-5)
 
     
