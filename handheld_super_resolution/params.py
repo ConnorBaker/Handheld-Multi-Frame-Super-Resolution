@@ -2,8 +2,6 @@ import warnings
 import numpy as np
 
 def sanitize_config(config, imshape):
-    if config.mode == "grey" and config.grey_method != "FFT":
-        raise NotImplementedError("Grey level images should be obtained with FFT")
         
     assert config.scale >= 1
 
@@ -16,7 +14,6 @@ def sanitize_config(config, imshape):
         raise ValueError("Robustness mask cannot be saved if robustness is disabled.")
 
     assert config.merging.kernel in ['steerable', 'iso'], f"Unknown kernel type {config.merging.kernel}"
-    assert config.mode in ["bayer", 'grey'], f"Unknown mode {config.mode}"
 
     if sum([1 if x.enabled else 0 for x in [config.accumulated_robustness_denoiser.median,
                                             config.accumulated_robustness_denoiser.gauss,

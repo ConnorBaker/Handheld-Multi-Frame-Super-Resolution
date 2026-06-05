@@ -155,7 +155,7 @@ def compute_grey_images_decimate_cupy(img):
 def frame_count_denoising_gauss(image, r_acc, config):
     denoised = cuda.device_array(image.shape, DEFAULT_NUMPY_FLOAT_TYPE)
     
-    grey_mode = config.mode == 'grey'
+    grey_mode = False  # grey mode removed; pipeline is bayer-only
     scale = config.scale
     sigma_max = config.sigma_max
     max_frame_count = config.max_frame_count
@@ -219,7 +219,7 @@ def denoise_power_gauss(r_acc, sigma_max, r_max):
 def frame_count_denoising_median(image, r_acc, config):
     denoised = cuda.device_array(image.shape, DEFAULT_NUMPY_FLOAT_TYPE)
 
-    grey_mode = config.mode == 'grey'
+    grey_mode = False  # grey mode removed; pipeline is bayer-only
     scale = config.scale
     radius_max = config.radius_max
     max_frame_count = config.max_frame_count

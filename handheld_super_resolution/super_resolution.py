@@ -72,7 +72,6 @@ def main(ref_img, comp_imgs, config):
 
     compute_grey_images_ = timer(compute_grey_images, verbose_3, end_s="- Ref grey image estimated by {}".format(grey_method))
     init_robustness_ = timer(init_robustness, verbose_2, "\nEstimating ref image local stats", 'Local stats estimated (Total)')
-    compute_grey_images_ = timer(compute_grey_images, verbose_3, end_s="- grey images estimated by {}".format(grey_method))
     compute_robustness_ = timer(compute_robustness, verbose_2, '\nEstimating robustness', 'Robustness estimated (Total)')
     estimate_kernels_ = timer(estimate_kernels, verbose_2, '\nEstimating kernels', 'Kernels estimated (Total)')
     merge_ = timer(merge, verbose_2, '\nAccumulating Image', 'Image accumulated (Total)')
@@ -81,7 +80,6 @@ def main(ref_img, comp_imgs, config):
     init_alignment_ = timer(init_alignment, verbose_2, '\nInitializing alignment', 'Alignment initialized (Total)')
     align_ = timer(align, verbose_2, '\nBeginning alignment', 'Image aligned (Total)')
 
-    bayer_mode = config.mode=='bayer'
     debug_mode = config.debug
     debug_dict = {"robustness":[],
                   "flow":[]}
@@ -103,11 +101,8 @@ def main(ref_img, comp_imgs, config):
         print("\nProcessing reference image ---------\n")
         t1 = time.perf_counter()
 
-    #### Raw to grey
-    if bayer_mode :
-        cuda_ref_grey = compute_grey_images_(cuda_ref_img, grey_method)
-    else:
-        cuda_ref_grey = cuda_ref_img
+    #### Raw to grey (alignment proxy)
+    cuda_ref_grey = compute_grey_images_(cuda_ref_img, grey_method)
 
     ref_pyramid, tyled_pyr, ref_tiled_fft, ref_gradx, ref_grady, ref_hessian = init_alignment_(cuda_ref_grey, config)
 
@@ -141,11 +136,8 @@ def main(ref_img, comp_imgs, config):
         # cuda_img = cuda.to_device(comp_imgs[im_id])
         cuda.to_device(comp_imgs[im_id], to=cuda_img, stream=stream)
         
-        #### Compute Grey Images
-        if bayer_mode:
-            cuda_im_grey = compute_grey_images(comp_imgs[im_id], grey_method)
-        else:
-            cuda_im_grey = cuda_img
+        #### Compute Grey Images (alignment proxy)
+        cuda_im_grey = compute_grey_images(comp_imgs[im_id], grey_method)
         
         cuda_final_alignment = align_(ref_pyramid, tyled_pyr, ref_tiled_fft, ref_gradx, ref_grady, ref_hessian,
                         cuda_im_grey, config)
@@ -231,9 +223,6 @@ def process(burst_path, config):
         alpha = config.noise_model.alpha
         beta = config.noise_model.beta
     ## The noise model exif are already scaled for the image ISO.
-    elif config.mode == 'grey':
-        alpha = tags['Image Tag 0xC761'].values[0][0]
-        beta = tags['Image Tag 0xC761'].values[1][0]
     else:
         alpha = sum([x[0] for x in tags['Image Tag 0xC761'].values[::2]])/3
         beta = sum([x[0] for x in tags['Image Tag 0xC761'].values[1::2]])/3

@@ -46,21 +46,17 @@ def init_robustness(ref_img, cfa_pattern, white_balance, config):
         local standard deviations of the reference image.
 
     """
-    bayer_mode = config.mode == 'bayer'
     if not config.robustness.enabled:
         return None, None
 
     # Computing guide image
-    if bayer_mode:
-        guide_ref_img = compute_guide_image_cupy(ref_img, cfa_pattern, white_balance)
-    else:
-        guide_ref_img = cp.asarray(ref_img, dtype=cp.float32)[None]
+    guide_ref_img = compute_guide_image_cupy(ref_img, cfa_pattern, white_balance)
 
     local_means, local_stds = compute_local_stats_cupy(guide_ref_img)
 
     # Upscale stats to raw coarse scale (no flow for the reference)
-    local_means = upscale_warp_stats_cupy(local_means, bayer_mode)
-    local_stds = upscale_warp_stats_cupy(local_stds, bayer_mode)
+    local_means = upscale_warp_stats_cupy(local_means, True)
+    local_stds = upscale_warp_stats_cupy(local_stds, True)
 
     return local_means, local_stds
     
@@ -94,7 +90,6 @@ def compute_robustness(comp_img, ref_local_means, ref_local_stds, flows, cfa_pat
         Locally minimized Robustness map, sampled at the center of
         every bayer quad
     """
-    bayer_mode = config.mode == 'bayer'
     if not config.robustness.enabled:
         return cp.ones(comp_img.shape, dtype=cp.float32)
 
@@ -107,14 +102,11 @@ def compute_robustness(comp_img, ref_local_means, ref_local_stds, flows, cfa_pat
     std_curve, diff_curve = noise_model
 
     # Computing guide image
-    if bayer_mode:
-        guide_img = compute_guide_image_cupy(comp_img, cfa_pattern, white_balance)
-    else:
-        guide_img = cp.asarray(comp_img, dtype=cp.float32)[None]
+    guide_img = compute_guide_image_cupy(comp_img, cfa_pattern, white_balance)
 
     # Local stats (before flow), then upscale + warp to raw coarse scale
     comp_local_means, _ = compute_local_stats_cupy(guide_img)
-    comp_local_means = upscale_warp_stats_cupy(comp_local_means, bayer_mode, tile_size, flows)
+    comp_local_means = upscale_warp_stats_cupy(comp_local_means, True, tile_size, flows)
 
     # color distance, noise model, flow-discontinuity penalty, threshold, local min
     d_p = compute_dist_cupy(ref_local_means, comp_local_means)

@@ -49,7 +49,6 @@ def estimate_kernels(img, config):
         Covariance matrices Omega_n, sampled at the center of each bayer quad.
 
     """    
-    bayer_mode = config.mode=='bayer'
     verbose_3 = config.verbose >= 3
 
 
@@ -78,10 +77,7 @@ def estimate_kernels(img, config):
     
     #__ Variance stabilization + decimate to grey (CuPy; numba can't JIT here)
     img = gat_cupy(img, alpha, beta)
-    if bayer_mode:
-        img_grey = compute_grey_images_decimate_cupy(img)
-    else:
-        img_grey = cp.asarray(img, dtype=cp.float32)
+    img_grey = compute_grey_images_decimate_cupy(img)
 
     #__ Computing grads (torch convolutions run on all GPUs)
     th_grey_img = to_torch(cp.ascontiguousarray(img_grey))[None, None]

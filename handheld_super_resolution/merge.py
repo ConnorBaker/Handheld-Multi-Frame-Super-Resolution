@@ -43,7 +43,6 @@ def merge_ref(ref_img, kernels, num, den, cfa_pattern, config, acc_rob=None):
 
     """
     scale = config.scale
-    bayer_mode = config.mode == 'bayer'
     iso_kernel = config.merging.kernel == 'iso'
 
     robustness_denoise = config.accumulated_robustness_denoiser.enabled
@@ -58,7 +57,7 @@ def merge_ref(ref_img, kernels, num, den, cfa_pattern, config, acc_rob=None):
 
     # CuPy RawKernel replacement for the numba accumulate_ref (numba can't JIT here).
     merge_ref_accumulate_cupy(
-        ref_img, kernels, int(bayer_mode), int(iso_kernel), float(scale),
+        ref_img, kernels, 1, int(iso_kernel), float(scale),  # bayer-only pipeline
         cfa_pattern, num, den, acc_rob,
         int(robustness_denoise), int(max_frame_count), int(rad_max), float(max_multiplier))
     
@@ -96,14 +95,13 @@ def merge(comp_img, alignments, covs, r, num, den, cfa_pattern, config):
 
     """
     scale = config.scale
-    bayer_mode = config.mode == 'bayer'
     iso_kernel = config.merging.kernel == 'iso'
     tile_size = config.block_matching.tuning.tile_size
 
     # CuPy RawKernel replacement for the numba accumulate (numba can't JIT here).
     merge_accumulate_cupy(
         comp_img, alignments, covs, r,
-        int(bayer_mode), int(iso_kernel), float(scale), int(tile_size),
+        1, int(iso_kernel), float(scale), int(tile_size),  # bayer-only pipeline
         cfa_pattern, num, den)
 
 
