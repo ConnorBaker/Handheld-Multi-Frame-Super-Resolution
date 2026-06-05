@@ -101,18 +101,9 @@ def compute_grey_images(img, method):
         # numba type is read directly from the torch tensor, so everything goes fine.
         return cuda.as_cuda_array(torch_img_grey.real)
     elif method == "decimating":
-        grey_imshape_y, grey_imshape_x = grey_imshape = imsize_y//2, imsize_x//2
-        
-        img_grey = cuda.device_array(grey_imshape, DEFAULT_NUMPY_FLOAT_TYPE)
-        
-        threadsperblock = (DEFAULT_THREADS, DEFAULT_THREADS)
-        blockspergrid_x = math.ceil(grey_imshape_x/threadsperblock[1])
-        blockspergrid_y = math.ceil(grey_imshape_y/threadsperblock[0])
-        blockspergrid = (blockspergrid_x, blockspergrid_y)
-        
-        cuda_decimate_to_grey[blockspergrid, threadsperblock](img, img_grey)
-        return img_grey
-        
+        # CuPy 2x2 block average (numba cuda_decimate_to_grey can't JIT here)
+        return compute_grey_images_decimate_cupy(img)
+
     else:
         raise NotImplementedError('Computation of gray level on GPU is only supported for FFT')
 

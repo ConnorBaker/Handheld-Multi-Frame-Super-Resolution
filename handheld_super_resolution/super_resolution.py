@@ -20,6 +20,7 @@ import warnings
 
 from pathlib import Path
 import numpy as np
+import cupy as cp
 from omegaconf import OmegaConf
 from numba import cuda
 import rawpy
@@ -114,14 +115,14 @@ def main(ref_img, comp_imgs, config):
     ref_local_means, ref_local_stds = init_robustness_(cuda_ref_img, cfa_pattern, white_balance, config)
 
     if accumulate_r:
-        accumulated_r = cuda.to_device(np.zeros(ref_local_means.shape[1:]))
+        accumulated_r = cp.zeros(tuple(ref_local_means.shape[1:]), dtype=cp.float32)
 
     scale = config.scale
     native_imshape_y, native_imshape_x = cuda_ref_img.shape
     output_size = (round(scale*native_imshape_y), round(scale*native_imshape_x))
-    # zeros init of num and den
-    num = cuda.to_device(np.zeros((*output_size, 3), dtype = DEFAULT_NUMPY_FLOAT_TYPE))
-    den = cuda.to_device(np.zeros((*output_size, 3), dtype = DEFAULT_NUMPY_FLOAT_TYPE))
+    # zeros init of num and den (CuPy: written by the merge RawKernels)
+    num = cp.zeros((*output_size, 3), dtype=cp.float32)
+    den = cp.zeros((*output_size, 3), dtype=cp.float32)
     
     if verbose :
         cuda.synchronize()
@@ -195,8 +196,8 @@ def main(ref_img, comp_imgs, config):
         print(s, ' ' * (50 - len(s)), ': ', round((time.perf_counter() - t1), 2), 'seconds')
     
     if accumulate_r :
-        debug_dict['accumulated robustness'] = accumulated_r
-        
+        debug_dict['accumulated robustness'] = cp.asnumpy(accumulated_r)
+
     return num, debug_dict
 
 
@@ -333,7 +334,7 @@ def process(burst_path, config):
             print('-- Post processing image')
         
         raw = rawpy.imread(ref_path)
-        output_image = raw2rgb.postprocess(raw, handheld_output.copy_to_host(),
+        output_image = raw2rgb.postprocess(raw, cp.asnumpy(handheld_output),
                                            config.postprocessing.do_color_correction,
                                            config.postprocessing.do_tonemapping,
                                            config.postprocessing.do_gamma_correction,
@@ -342,8 +343,8 @@ def process(burst_path, config):
                                            xyz2cam,
                                            ) 
     else:
-        output_image = handheld_output.copy_to_host()
-        
+        output_image = cp.asnumpy(handheld_output)
+
     # Applying image orientation
     if 'Image Orientation' in tags.keys():
         ori = tags['Image Orientation'].values[0]

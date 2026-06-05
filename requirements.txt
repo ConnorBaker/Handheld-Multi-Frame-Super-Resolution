@@ -1,0 +1,12 @@
+numpy
+scipy
+omegaconf
+rawpy
+exifread
+opencv-python-headless
+colour-demosaicing
+scikit-image
+imageio
+matplotlib
+tqdm
+pytest

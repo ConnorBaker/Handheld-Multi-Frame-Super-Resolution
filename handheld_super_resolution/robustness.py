@@ -17,8 +17,15 @@ import math
 import numpy as np
 from numba import cuda, uint8
 
+import cupy as cp
+
 from .utils import getTime, DEFAULT_CUDA_FLOAT_TYPE,DEFAULT_NUMPY_FLOAT_TYPE, DEFAULT_THREADS, clamp, timer
 from .utils_image import dogson_biquadratic_kernel, dogson_quadratic_kernel
+from .cupy_ops import (
+    compute_guide_image_cupy, compute_local_stats_cupy, upscale_warp_stats_cupy,
+    compute_dist_cupy, apply_noise_model_cupy, compute_s_cupy,
+    robustness_threshold_cupy, local_min_cupy,
+)
 
 def init_robustness(ref_img, cfa_pattern, white_balance, config):
     """
@@ -45,35 +52,23 @@ def init_robustness(ref_img, cfa_pattern, white_balance, config):
         local standard deviations of the reference image.
 
     """
-    verbose_3 = config.verbose >= 3
-    
-    compute_guide_image_ = timer(compute_guide_image, verbose_3, " - Decimating images to RGB", ' - Image decimated')
-    compute_local_stats_ = timer(compute_local_stats, verbose_3, end_s=' - Local stats estimated')
-    upscale_warp_stats_ = timer(upscale_warp_stats, verbose_3, ' - Local stats warped upscaled')
-    
-    imshape_y, imshape_x = ref_img.shape
-
-    bayer_mode = config.mode=='bayer'
-    r_on = config.robustness.enabled
-
-    if r_on :         
-        # Computing guide image
-
-        if bayer_mode:
-            guide_ref_img = compute_guide_image_(ref_img, cfa_pattern, white_balance)
-        else:
-            # Numba friendly code to add 1 channel
-            guide_ref_img = ref_img.reshape((1, imshape_y, imshape_x)) 
-            
-        local_means, local_stds = compute_local_stats_(guide_ref_img)
-        
-        # Upscale stats to raw coarse scale
-        local_means = upscale_warp_stats(local_means)
-        local_stds = upscale_warp_stats_(local_stds)
-        
-        return local_means, local_stds
-    else:
+    bayer_mode = config.mode == 'bayer'
+    if not config.robustness.enabled:
         return None, None
+
+    # Computing guide image
+    if bayer_mode:
+        guide_ref_img = compute_guide_image_cupy(ref_img, cfa_pattern, white_balance)
+    else:
+        guide_ref_img = cp.asarray(ref_img, dtype=cp.float32)[None]
+
+    local_means, local_stds = compute_local_stats_cupy(guide_ref_img)
+
+    # Upscale stats to raw coarse scale (no flow for the reference)
+    local_means = upscale_warp_stats_cupy(local_means, bayer_mode)
+    local_stds = upscale_warp_stats_cupy(local_stds, bayer_mode)
+
+    return local_means, local_stds
     
     
 def compute_robustness(comp_img, ref_local_means, ref_local_stds, flows, cfa_pattern, white_balance, noise_model, config):
@@ -105,21 +100,9 @@ def compute_robustness(comp_img, ref_local_means, ref_local_stds, flows, cfa_pat
         Locally minimized Robustness map, sampled at the center of
         every bayer quad
     """
-    current_time, verbose_3 = time.perf_counter(), config.verbose >= 3
-    
-    compute_guide_image_ = timer(compute_guide_image, verbose_3, " - Decimating images to RGB", ' - Image decimated')
-    compute_local_stats_ = timer(compute_local_stats, verbose_3, end_s=' - Local stats estimated')
-    upscale_warp_stats_ = timer(upscale_warp_stats, verbose_3, end_s=' - Local stats warped and upscaled')
-    compute_dist_ = timer(compute_dist, verbose_3, end_s=' - Estimated color distances')
-    apply_noise_model_ = timer(apply_noise_model, verbose_3, end_s=' - Applied noise model')
-    compute_s_ = timer(compute_s, verbose_3, end_s=' - Flow irregularities registered')
-    robustness_threshold_ = timer(robustness_threshold, verbose_3, end_s=' - Robustness Estimated')
-    local_min_ = timer(local_min, verbose_3, end_s=' - Robustness locally minimized')
-    
-    imshape_y, imshape_x = comp_img.shape
-
-    bayer_mode = config.mode=='bayer'
-    r_on = config.robustness.enabled
+    bayer_mode = config.mode == 'bayer'
+    if not config.robustness.enabled:
+        return cp.ones(comp_img.shape, dtype=cp.float32)
 
     tile_size = config.block_matching.tuning.tile_size
     t = config.robustness.tuning.t
@@ -127,46 +110,25 @@ def compute_robustness(comp_img, ref_local_means, ref_local_stds, flows, cfa_pat
     s2 = config.robustness.tuning.s2
     Mt = config.robustness.tuning.Mt
 
-    n_patch_y, n_patch_x, _ = flows.shape
-    
-    if bayer_mode:
-        guide_imshape = imshape_y//2, imshape_x//2
-    else:
-        guide_imshape = imshape_y, imshape_x
-          
-    if not r_on : 
-        temp = np.ones_like(comp_img, DEFAULT_NUMPY_FLOAT_TYPE)
-        return cuda.to_device(temp)
-    r = cuda.device_array(guide_imshape, DEFAULT_NUMPY_FLOAT_TYPE)
-    
-    cuda_std_curve, cuda_diff_curve = noise_model
-        
+    std_curve, diff_curve = noise_model
+
     # Computing guide image
     if bayer_mode:
-        guide_img = compute_guide_image_(comp_img, cfa_pattern, white_balance)
+        guide_img = compute_guide_image_cupy(comp_img, cfa_pattern, white_balance)
     else:
-        guide_img = comp_img.reshape((1, imshape_y, imshape_x)) # Adding 1 channel
-        
+        guide_img = cp.asarray(comp_img, dtype=cp.float32)[None]
 
-    # Computing local stats (before applying optical flow)
-    comp_local_means, _ = compute_local_stats_(guide_img)
-    
-    # Upscale and warp local means
-    comp_local_means = upscale_warp_stats_(comp_local_means, 
-                                            tile_size, flows)
-    
-    # computing d
-    d_p = compute_dist_(ref_local_means, comp_local_means)
-    
-    
-    # leveraging the noise model
-    d_sq, sigma_sq = apply_noise_model_(d_p, ref_local_means, ref_local_stds,
-                                        cuda_std_curve, cuda_diff_curve)
-    
-    # applying flow discontinuity penalty
-    S = compute_s_(flows, Mt, s1, s2)
-    R = robustness_threshold_(d_sq, sigma_sq, S, t, tile_size, bayer_mode)
-    r = local_min_(R)        
+    # Local stats (before flow), then upscale + warp to raw coarse scale
+    comp_local_means, _ = compute_local_stats_cupy(guide_img)
+    comp_local_means = upscale_warp_stats_cupy(comp_local_means, bayer_mode, tile_size, flows)
+
+    # color distance, noise model, flow-discontinuity penalty, threshold, local min
+    d_p = compute_dist_cupy(ref_local_means, comp_local_means)
+    d_sq, sigma_sq = apply_noise_model_cupy(d_p, ref_local_means, ref_local_stds,
+                                            std_curve, diff_curve)
+    S = compute_s_cupy(flows, Mt, s1, s2)
+    R = robustness_threshold_cupy(d_sq, sigma_sq, S, t, tile_size)
+    r = local_min_cupy(R)
     return r
 
 

@@ -6,6 +6,7 @@ from numba import cuda
 import torch
 
 from .utils import clamp, DEFAULT_NUMPY_FLOAT_TYPE, DEFAULT_CUDA_FLOAT_TYPE, DEFAULT_TORCH_FLOAT_TYPE, DEFAULT_THREADS
+from .cupy_ops import block_matching_l1_cupy, to_torch
 FLOAT = DEFAULT_NUMPY_FLOAT_TYPE
 
 BOX_FILTER_8 = torch.as_tensor(np.ones((1,1,8,8)), dtype=DEFAULT_TORCH_FLOAT_TYPE, device="cuda")
@@ -76,31 +77,13 @@ def align_lvl_block_matching_L2(tyled_pyr_lvl, ref_fft_lvl, moving_lvl, alignmen
     alignment[:, :, 1] += dy
     
 def align_lvl_block_matching_L1(ref_lvl, moving_lvl, alignments, l, config):
-    h, w, _ = alignments.shape
     tile_size = config.block_matching.tuning.tile_sizes[l]
     search_radius = config.block_matching.tuning.search_radii[l]
-    ny, nx, _ = alignments.shape
 
-    # New way, 1 thread per pixel
-    threadsperblock = (tile_size, tile_size)
-    if tile_size == 8:
-        raise NotImplementedError("L1 local search kernel for tile size {} not implemented".format(tile_size))
-    elif tile_size == 16:
-        kernel = cuda_L1_local_search16
-        assert 2 * search_radius + 16 <= 32, f"L1 local search kernel only implemented for search windows up to size 32, which is not the case for tile size {tile_size} and search radius {search_radius}."
-    elif tile_size == 32:
-        kernel = cuda_L1_local_search32
-    elif tile_size == 64:
-        kernel = cuda_L1_local_search64
-        threadsperblock = (64, 16)  # because each thread handles 4 pixels
-        assert 2 * search_radius <= 16, f"Cant handle search radius {search_radius} with tile size {tile_size} in L1 local search kernel."
-    else:
-        raise NotImplementedError("L1 local search kernel for tile size {} not implemented".format(tile_size))
-    blockspergrid_x = nx
-    blockspergrid_y = ny
-    blockspergrid = (blockspergrid_x, blockspergrid_y)
-    kernel[blockspergrid, threadsperblock](
-        ref_lvl, moving_lvl, search_radius, alignments)
+    # CuPy replacement for the numba cuda_L1_local_search* (numba can't JIT here).
+    new_flow = block_matching_l1_cupy(
+        ref_lvl, moving_lvl, alignments, tile_size, search_radius)
+    alignments.copy_(to_torch(new_flow))
 
 @cuda.jit
 def cuda_L1_local_search16(ref, moving, search_radius, alignments):

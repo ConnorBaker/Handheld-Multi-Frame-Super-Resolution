@@ -18,6 +18,7 @@ from numba import uint8, cuda
 from .utils import clamp, DEFAULT_CUDA_FLOAT_TYPE, DEFAULT_NUMPY_FLOAT_TYPE, DEFAULT_THREADS
 from .utils_image import denoise_power_merge, denoise_range_merge
 from .linalg import quad_mat_prod, invert_2x2, interpolate_cov
+from .cupy_ops import merge_accumulate_cupy, merge_ref_accumulate_cupy
 
 def merge_ref(ref_img, kernels, num, den, cfa_pattern, config, acc_rob=None):
     """
@@ -47,36 +48,24 @@ def merge_ref(ref_img, kernels, num, den, cfa_pattern, config, acc_rob=None):
 
     """
     scale = config.scale
-
     bayer_mode = config.mode == 'bayer'
     iso_kernel = config.merging.kernel == 'iso'
 
     robustness_denoise = config.accumulated_robustness_denoiser.enabled
-    # numba is strict on types and dimension : let's use a consistent object
-    # for acc_rob even when it is not used.
     if robustness_denoise:
         rad_max = config.accumulated_robustness_denoiser.merge.rad_max
         max_multiplier = config.accumulated_robustness_denoiser.merge.max_multiplier
         max_frame_count = config.accumulated_robustness_denoiser.merge.max_frame_count
     else:
-        acc_rob = cuda.device_array((1,1), DEFAULT_NUMPY_FLOAT_TYPE)
         rad_max = 0
-        max_multiplier = 0.
+        max_multiplier = 0.0
         max_frame_count = 0
-    
-    
-    output_shape_y, output_shape_x, _ = num.shape
 
-    # dispatching threads. 1 thread for 1 output pixel
-    threadsperblock = (DEFAULT_THREADS, DEFAULT_THREADS) # maximum, we may take less
-    
-    blockspergrid_x = math.ceil(output_shape_x/threadsperblock[1])
-    blockspergrid_y = math.ceil(output_shape_y/threadsperblock[0])
-    blockspergrid = (blockspergrid_x, blockspergrid_y)
-    
-    accumulate_ref[blockspergrid, threadsperblock](
-        ref_img, kernels, bayer_mode, iso_kernel, scale, cfa_pattern,
-        num, den, acc_rob, robustness_denoise, max_frame_count, rad_max, max_multiplier)
+    # CuPy RawKernel replacement for the numba accumulate_ref (numba can't JIT here).
+    merge_ref_accumulate_cupy(
+        ref_img, kernels, int(bayer_mode), int(iso_kernel), float(scale),
+        cfa_pattern, num, den, acc_rob,
+        int(robustness_denoise), int(max_frame_count), int(rad_max), float(max_multiplier))
     
     
 @cuda.jit
@@ -264,26 +253,15 @@ def merge(comp_img, alignments, covs, r, num, den, cfa_pattern, config):
 
     """
     scale = config.scale
-
     bayer_mode = config.mode == 'bayer'
     iso_kernel = config.merging.kernel == 'iso'
     tile_size = config.block_matching.tuning.tile_size
 
-    native_im_size = comp_img.shape
-    # casting to integer to account for floating scale
-    output_size = (round(scale*native_im_size[0]), round(scale*native_im_size[1]))
-
-
-    # dispatching threads. 1 thread for 1 output pixel
-    threadsperblock = (DEFAULT_THREADS, DEFAULT_THREADS) # maximum, we may take less
-    blockspergrid_x = math.ceil(output_size[1]/threadsperblock[1])
-    blockspergrid_y = math.ceil(output_size[0]/threadsperblock[0])
-    blockspergrid = (blockspergrid_x, blockspergrid_y)
-                    
-    accumulate[blockspergrid, threadsperblock](
+    # CuPy RawKernel replacement for the numba accumulate (numba can't JIT here).
+    merge_accumulate_cupy(
         comp_img, alignments, covs, r,
-        bayer_mode, iso_kernel, scale, tile_size, cfa_pattern,
-        num, den)
+        int(bayer_mode), int(iso_kernel), float(scale), int(tile_size),
+        cfa_pattern, num, den)
 
 
 

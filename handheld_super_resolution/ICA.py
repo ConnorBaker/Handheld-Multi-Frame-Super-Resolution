@@ -6,6 +6,8 @@ import torch
 import torch.nn.functional as F
 
 from .utils import clamp, DEFAULT_NUMPY_FLOAT_TYPE, DEFAULT_CUDA_FLOAT_TYPE, DEFAULT_TORCH_FLOAT_TYPE, DEFAULT_THREADS
+from .utils_image import compute_hessian_cupy
+from .cupy_ops import ica_iterate_cupy, to_torch
 FLOAT = DEFAULT_NUMPY_FLOAT_TYPE
 SOBEL_Y = torch.as_tensor(np.array([[-1], [0], [1]]), dtype=DEFAULT_TORCH_FLOAT_TYPE, device="cuda")[None, None]
 SOBEL_X = torch.as_tensor(np.array([[-1,0,1]]), dtype=DEFAULT_TORCH_FLOAT_TYPE, device="cuda")[None, None]
@@ -13,23 +15,12 @@ SOBEL_Y.requires_grad = False
 SOBEL_X.requires_grad = False
 
 def init_ica(image, tile_size, config):
-    imsize_y, imsize_x = image.shape
-    n_patch_y = imsize_y // tile_size 
-    n_patch_x = imsize_x // tile_size
-
+    # Gradients via torch (runs on all GPUs); Hessian via CuPy because numba's
+    # CUDA target cannot JIT on this hardware. gradx/grady stay torch tensors.
     gradx = F.conv2d(image[None, None], SOBEL_X, padding='same').squeeze()
     grady = F.conv2d(image[None, None], SOBEL_Y, padding='same').squeeze()
 
-    gradx = cuda.as_cuda_array(gradx)
-    grady = cuda.as_cuda_array(grady)
-
-    hessian = cuda.device_array((n_patch_y, n_patch_x, 2, 2), DEFAULT_NUMPY_FLOAT_TYPE)
-
-    threadsperblock = (DEFAULT_THREADS, DEFAULT_THREADS)
-    blockspergrid_x = math.ceil(n_patch_x / threadsperblock[1])
-    blockspergrid_y = math.ceil(n_patch_y / threadsperblock[0])
-    blockspergrid = (blockspergrid_x, blockspergrid_y)
-    compute_hessian[blockspergrid, threadsperblock](gradx, grady, tile_size, hessian)
+    hessian = compute_hessian_cupy(gradx, grady, tile_size)
 
     return gradx, grady, hessian
 
@@ -77,30 +68,15 @@ def compute_hessian(gradx, grady, tile_size, hessian):
 
 def align_lvl_ica(ref_img, ref_gradx_lvl, ref_grady_lvl, ref_hessian_lvl,
                   moving_lvl, alignment, l, config):
-    verbose_3 = config.verbose >= 3
     tile_size = config.block_matching.tuning.tile_sizes[l]
+    n_iter = config.ica.tuning.n_iter
 
-    np_y, np_x, _ = alignment.shape
-
-    # New way, 1 thread/pixel
-    threadsperblock = (tile_size, tile_size)
-    blockspergrid_x = np_x
-    blockspergrid_y = np_y
-    blockspergrid = (blockspergrid_x, blockspergrid_y)
-    if tile_size == 8:
-        cuda_kernel = ica_kernel_8
-    elif tile_size == 16:
-        cuda_kernel = ica_kernel_16
-    elif tile_size == 32:
-        cuda_kernel = ica_kernel_32
-    elif tile_size == 64:
-        cuda_kernel = ica_kernel_64
-        threadsperblock = (64, 16)  # because each thread handles 4 pixels
-    else:
-        raise NotImplementedError("ICA kernel for tile size {} not implemented".format(tile_size))
-    cuda_kernel[blockspergrid, threadsperblock](
+    # CuPy replacement for the numba ica_kernel_* (numba can't JIT here).
+    new_flow = ica_iterate_cupy(
         ref_img, ref_gradx_lvl, ref_grady_lvl, ref_hessian_lvl,
-        moving_lvl, alignment, config.ica.tuning.n_iter)
+        moving_lvl, alignment, tile_size, n_iter)
+    # write the result back into the torch alignment tensor, in place
+    alignment.copy_(to_torch(new_flow))
 
 @cuda.jit
 def ica_kernel_8(ref_img, gradx, grady, hessian, moving, alignment, niter):

@@ -17,9 +17,12 @@ from numba import cuda
 import torch as th
 import torch.nn.functional as F
 
+import cupy as cp
+
 from .linalg import get_eigen_elmts_2x2
 from .utils import clamp, DEFAULT_CUDA_FLOAT_TYPE, DEFAULT_NUMPY_FLOAT_TYPE, DEFAULT_TORCH_FLOAT_TYPE, DEFAULT_THREADS, getTime, timer
-from .utils_image import compute_grey_images, GAT
+from .utils_image import compute_grey_images, GAT, compute_grey_images_decimate_cupy
+from .cupy_ops import gat_cupy, estimate_cov_cupy, to_torch
 
 
 SEL_HARD_THRESHOLD = 0
@@ -77,62 +80,32 @@ def estimate_kernels(img, config):
     
     #__ Performing Variance Stabilization Transform
     
-    img = GAT_(img, alpha, beta)
-        
-    #__ Decimate to grey
-    if bayer_mode : 
-        img_grey = compute_grey_images_(img, method="decimating")
-    
-    else :
-        img_grey = img # no need to copy now, they will be copied to gpu later.
-        
-    grey_imshape_y, grey_imshape_x = grey_imshape = img_grey.shape
-    
-        
-    #__ Computing grads
-    # Horizontal filters
-    th_grey_img = th.as_tensor(img_grey, dtype=DEFAULT_TORCH_FLOAT_TYPE, device="cuda")[None, None]
-    
-    
-    grad_kernel1 = np.array([[[[-0.5, 0.5]]],
-                              
-                              [[[ 0.5, 0.5]]]])
-    grad_kernel1 = th.as_tensor(grad_kernel1, dtype=DEFAULT_TORCH_FLOAT_TYPE, device="cuda")
-    
-    # Vertical filters
-    grad_kernel2 = np.array([[[[0.5], 
-                                [0.5]]],
-                              
-                              [[[-0.5], 
-                                [0.5]]]])
-    grad_kernel2 = th.as_tensor(grad_kernel2, dtype=DEFAULT_TORCH_FLOAT_TYPE, device="cuda")
+    #__ Variance stabilization + decimate to grey (CuPy; numba can't JIT here)
+    img = gat_cupy(img, alpha, beta)
+    if bayer_mode:
+        img_grey = compute_grey_images_decimate_cupy(img)
+    else:
+        img_grey = cp.asarray(img, dtype=cp.float32)
 
+    #__ Computing grads (torch convolutions run on all GPUs)
+    th_grey_img = to_torch(cp.ascontiguousarray(img_grey))[None, None]
+
+    grad_kernel1 = np.array([[[[-0.5, 0.5]]],
+                             [[[ 0.5, 0.5]]]])
+    grad_kernel1 = th.as_tensor(grad_kernel1, dtype=DEFAULT_TORCH_FLOAT_TYPE, device="cuda")
+    grad_kernel2 = np.array([[[[0.5],
+                               [0.5]]],
+                             [[[-0.5],
+                               [0.5]]]])
+    grad_kernel2 = th.as_tensor(grad_kernel2, dtype=DEFAULT_TORCH_FLOAT_TYPE, device="cuda")
 
     tmp = F.conv2d(th_grey_img, grad_kernel1)
     th_full_grad = F.conv2d(tmp, grad_kernel2, groups=2)
-    # The default padding mode reduces the shape of grey_img of 1 pixel in each
-    # direction, as expected
-    
-    cuda_full_grads = cuda.as_cuda_array(th_full_grad.squeeze().transpose(0,1).transpose(1, 2))
-    # shape [y, x, 2]
-    if verbose_3:
-        cuda.synchronize()
-        t1 = getTime(t1, "- Gradients computed")
-        
-    covs = cuda.device_array(grey_imshape + (2,2), DEFAULT_NUMPY_FLOAT_TYPE)
+    # shape [y, x, 2]; the convolution reduces each spatial dim by 1
+    full_grads = cp.asarray(th_full_grad.squeeze().permute(1, 2, 0).contiguous())
 
-    threadsperblock = (DEFAULT_THREADS, DEFAULT_THREADS)
-    blockspergrid_x = math.ceil(grey_imshape_x/threadsperblock[1])
-    blockspergrid_y = math.ceil(grey_imshape_y/threadsperblock[0])
-    blockspergrid = (blockspergrid_x, blockspergrid_y)
-    
-    cuda_estimate_kernel[blockspergrid, threadsperblock](cuda_full_grads,
-                                    k_detail, k_denoise, D_th, D_tr, k_stretch, k_shrink,
-                                    covs, selection_law)  
-    if verbose_3:
-        cuda.synchronize()
-        t1 = getTime(t1, "- Covariances estimated")
-    
+    covs = estimate_cov_cupy(full_grads, k_detail, k_denoise, D_th, D_tr,
+                             k_stretch, k_shrink, selection_law)
     return covs
 
 @cuda.jit

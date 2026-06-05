@@ -61,25 +61,14 @@ def mse(im1, im2):
 
 def divide(num, den):
     """
-    Performs num = num/den
-
-    Parameters
-    ----------
-    num : device array[ny, nx, n_channels]
-    
-    den : device array[ny, nx, n_channels]
-
-
+    Performs num = num/den (in place), via CuPy. ``num``/``den`` may be numba
+    device arrays, torch tensors or cupy arrays (zero-copy through the CUDA
+    array interface) -- numba kernels cannot JIT on this hardware.
     """
+    import cupy as cp
     assert num.shape == den.shape
-    n_channels = num.shape[-1]
-    threadsperblock = (DEFAULT_THREADS, DEFAULT_THREADS, 1)
-    blockspergrid_x = math.ceil(num.shape[1]/threadsperblock[1])
-    blockspergrid_y = math.ceil(num.shape[0]/threadsperblock[0])
-    blockspergrid_z = n_channels
-    blockspergrid = (blockspergrid_x, blockspergrid_y, blockspergrid_z)
-    
-    cuda_divide[blockspergrid, threadsperblock](num, den)
+    n = cp.asarray(num)
+    cp.divide(n, cp.asarray(den), out=n)
 
 @cuda.jit
 def cuda_divide(num, den):
@@ -91,27 +80,14 @@ def cuda_divide(num, den):
         
 def add(A, B):
     """
-    performs A += B for 2d arrays
-
-    Parameters
-    ----------
-    A : device_array[ny, nx]
-
-    B : device_array[ny, nx]
-        
-
-    Returns
-    -------
-    None.
-
+    Performs A += B (in place), via CuPy. ``A``/``B`` may be numba device
+    arrays, torch tensors or cupy arrays (zero-copy through the CUDA array
+    interface) -- numba kernels cannot JIT on this hardware.
     """
+    import cupy as cp
     assert A.shape == B.shape
-    threadsperblock = (DEFAULT_THREADS, DEFAULT_THREADS)
-    blockspergrid_x = math.ceil(A.shape[1]/threadsperblock[1])
-    blockspergrid_y = math.ceil(A.shape[0]/threadsperblock[0])
-    blockspergrid = (blockspergrid_x, blockspergrid_y)
-    
-    cuda_add[blockspergrid, threadsperblock](A, B)
+    a = cp.asarray(A)
+    a += cp.asarray(B)
 
 @cuda.jit
 def cuda_add(A, B):
