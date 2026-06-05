@@ -6,6 +6,12 @@ Eboli, ECCV 2022) at commit `fbe8e24097900e15d8ce2a165cc9e9958708805e`. See LICE
 
 What's vendored and why:
 - `basicblock.py` — KAIR building blocks for the ResUNet defringer (torch-only).
+  **Trimmed** to only the 9 blocks the ResUNet transitively constructs
+  (`sequential`, `conv`, `ResBlock`, the three `downsample_*` and three
+  `upsample_*` factories); upstream ships ~23 (the other 14 — strideconv/ESA/
+  attention variants, `IMDBlock`, etc. — are never referenced by this checkpoint).
+  Verified bit-identical: loads the checkpoint strict and the forward output is
+  unchanged (max-abs diff 0.0).
 - `model.py` — the `ResUNet` defringer (verbatim from upstream `modules.py`) +
   `AberrationCorrection`, an adaptation of upstream `OpticsCorrection` that
   (a) REUSES our vendored Polyblur for the per-tile blur estimation + polynomial

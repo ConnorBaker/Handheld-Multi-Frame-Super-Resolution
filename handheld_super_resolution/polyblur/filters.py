@@ -2,7 +2,6 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import torch.fft
-import scipy.fft
 
 from . import utils
 
@@ -24,12 +23,9 @@ def convolve2d(img, kernel, ksize=25, padding='same', method='direct'):
     :return imout: (B,C,H,W) torch.tensor, the filtered images
     """
     if method == 'direct':
-        if type(kernel) == torch.Tensor:  # if we have 2D kernels, do general 2D convolution
-            return conv2d_(img, kernel, padding)
-        else:                                     # else, tuples and do Gaussian-specific 1D separable convolution
-            return gaussian_separable_conv2d_(img, kernel, ksize, padding)
+        return conv2d_(img, kernel, padding)
     elif method == 'fft':
-        assert(type(kernel) == torch.Tensor)  # for FFT, we only use 2D kernels
+        assert isinstance(kernel, torch.Tensor)  # for FFT, we only use 2D kernels
         X = torch.fft.fft2(utils.pad_with_kernel(img, kernel, mode='circular'))
         K = p2o(kernel, X.shape[-2:])
         return utils.crop_with_kernel( torch.real(torch.fft.ifft2(K * X)), kernel )
@@ -49,54 +45,7 @@ def conv2d_(img, kernel, padding='same'):
         return torch.cat(img, dim=1)
 
 
-def gaussian_separable_conv2d_(img, kernel, ksize, padding='same', threshold=1e-4):
-    """
-    Convolution with separable 1D Gaussian kernels on possibly non-orthogonal axes.
-    """
-    sigma, rho, theta = kernel
     
-    ## First process the orthogonal directions
-    mask = (theta % (np.pi / 2)) < threshold  # if theta is 0, 90 or 180 degrees, orthogonal directions
-    if mask.any():
-        sigma_x = sigma[mask]
-        sigma_y = rho[mask]
-        img[mask] = gaussian_xy_separable_conv2d_(img[mask], sigma_x, sigma_y, ksize, padding)
-
-    ## Second process the other directions
-    mask = (theta % (np.pi / 2)) >= threshold  # else, general case
-    if mask.any():
-        sigma_u = sigma[mask]
-        sigma_v = sigma[mask]
-        phi = theta[mask]
-        img[mask] = gaussian_xt_sperabla_conv2d_(img[mask], sigma_u, sigma_v, phi, ksize)
-
-    return img
-    
-
-def gaussian_xy_separable_conv2d_(img, sigma_x, sigma_y, ksize, padding='same'):
-    # Create the 1D kernel along x
-    t = torch.arange(-ksize//2 + 1, ksize//2 + 1, device=device).view(1, 1, 1, ksize)
-    t = t * t
-    kernel = torch.exp( - t / (2 * sigma_x * sigma_x))  # (1, 1, 1, ksize)
-    kernel /= kernel.sum()
-
-    # Horizontal filter
-    img = F.conv2d(img, kernel, padding='same', groups=img.shape[1])
-    img = img.transpose(-1,-2)
-
-    # Create the 1D kernel along y
-    kernel = torch.exp( - t / (2 * sigma_y * sigma_y))  # (1, 1, 1, ksize)
-    kernel /= kernel.sum()
-
-    # Vertical filter
-    img = F.conv2d(img, kernel, padding='same', groups=img.shape[1])
-    return img.transpose(-1,-2)
-
-
-def gaussian_xt_separable_conv2d_(img, sigma, rho, theta, ksize):
-    ## Call CUDA code here
-    return img
-
 
 
 #####################################################################
@@ -245,7 +194,6 @@ def dirac(dims):
     return kernel
 
 
-
 #####################################################################
 ####################### Fourier kernel ##############################
 #####################################################################
@@ -265,9 +213,9 @@ def p2o(psf, shape):
         # otf: NxCxHxWx2
         otf: NxCxHxW
     '''
-    otf = torch.zeros(psf.shape[:-2] + shape).type_as(psf)
-    otf[..., :psf.shape[2],:psf.shape[3]].copy_(psf)
-    for axis, axis_size in enumerate(psf.shape[2:]):
-        otf = torch.roll(otf, -int(axis_size / 2), dims=axis+2)
+    otf = torch.zeros(psf.shape[:-2] + shape, dtype=psf.dtype, device=psf.device)
+    otf[..., :psf.shape[2], :psf.shape[3]].copy_(psf)
+    kh, kw = psf.shape[-2:]
+    otf = torch.roll(otf, shifts=(-(kh // 2), -(kw // 2)), dims=(-2, -1))
     otf = torch.fft.fft2(otf, dim=(-2, -1))
     return otf

@@ -1,7 +1,6 @@
 import numpy as np
 import torch
 import torch.nn.functional as F
-from scipy.signal import fftconvolve
 
 from .filters import convolve2d
 

@@ -101,8 +101,9 @@ def normalize(images, q=0.0001):
     # wrong predictions in the presence of artifacts or noise.
     if q > 0:
         b, c, h, w = images.shape
-        value_min = torch.quantile(images.view(b, c, -1), q=q, dim=-1, keepdim=True)
-        value_max = torch.quantile(images.view(b, c, -1), q=1-q, dim=-1, keepdim=True)
+        # vendored-fix: keep 4D (b,c,1,1) so it broadcasts over (h,w), not the channel dim
+        value_min = torch.quantile(images.view(b, c, -1), q=q, dim=-1, keepdim=True).unsqueeze(-1)
+        value_max = torch.quantile(images.view(b, c, -1), q=1-q, dim=-1, keepdim=True).unsqueeze(-1)
     else:
         value_min = torch.amin(images, dim=(-1,-2), keepdim=True)
         value_max = torch.amax(images, dim=(-1,-2), keepdim=True)
