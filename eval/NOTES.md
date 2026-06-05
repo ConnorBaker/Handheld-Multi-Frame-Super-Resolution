@@ -1,0 +1,102 @@
+# Eval / sweep — running notes & findings
+
+Context: after porting the pipeline to CuPy for the GB10, the output looked soft
+(especially foliage) vs the Canon ground truth. This harness was built to (a)
+quantify quality vs Canon with perceptual metrics, (b) automatically find where
+the algorithm/config fails, and (c) sweep parameters (Optuna) to recover detail.
+
+## Key findings (burst 0003, Samsung, ISO 100, 14 frames; scale 2)
+
+- **The default config's multi-frame fusion is perceptually WORSE than a single
+  frame vs Canon**: DISTS 0.277 (multi) vs 0.275 (single); **90/140 tiles** have
+  multi worse than single. So at low ISO, the merge averages away detail faster
+  than it denoises.
+- The pipeline output is also **softer than a plain bilinear demosaic** of one
+  Samsung frame (Laplacian var building 163 vs 242, foliage 44 vs 112).
+- Worst tiles vs Canon are **high-frequency edges against sky** (bare branches,
+  power lines) and **foliage** — the registration-free detector finds tiles where
+  multi-frame keeps only ~9–16% of the single-frame sharpness.
+- Merge kernel covariance eigenvalues are ~0.5–0.8 px (big axis) / ~0.3 px²
+  (small axis); ~46% are near-isotropic. `k_detail` has a hard floor (~0.18):
+  below it the scale-1 demosaic loses cross-color support in the 3×3 window and
+  the output goes NaN.
+- Denoise params (`k_denoise`, `D_th`) barely move scale-1 sharpness — at scale 1
+  the merge is sampling-limited (3×3 window, ~1px spacing), so detail lives in
+  `scale` (SR) and in alignment quality, not kernel width.
+
+## Root-cause hypotheses (ranked)
+
+1. **Alignment precision on fine texture.** Multi-frame helps the static building
+   (Laplacian 163→206) but hurts foliage — averaging 13 frames across sub-pixel
+   alignment error smears high-freq texture. Robustness isn't protecting it (the
+   accumulated-robustness mask is ~12.6/13 *everywhere*, not discriminating).
+   ⇒ levers: `ica.tuning.n_iter`, `block_matching.tuning.search_radii`,
+   `robustness.tuning.t` (reject more aggressively).
+2. **Kernel-regression merge is inherently ~1px-soft at scale 1** (by design, for
+   denoising). The detail win is supposed to come from `scale=2`.
+3. **Possible port-induced softening** — *cannot be ruled out*: numba can't run on
+   the GB10, so I can't diff against the original implementation. "Softer than
+   bilinear" + "multi worse than single" are yellow flags. Definitive check =
+   run the original numba pipeline on a numba-capable GPU and diff.
+
+## Design decisions
+
+- Register **output → Canon frame** (compare at Canon's detail level); DISTS as
+  the objective (alignment-robust); color-match before scoring.
+- Cache the homography across sweep trials (geometry ~constant across configs).
+- Two failure detectors: Canon-anchored (rigorous) + registration-free (fast,
+  any burst, but conflates denoising).
+
+## Caveats
+
+- **Parallax / non-planar foreground**: one homography can't perfectly register
+  Canon (different viewpoint) to the output, so per-tile metrics on foreground
+  mix algorithm error with registration error. DISTS mitigates; the
+  registration-free detector cross-checks.
+- **Single-burst sweep** (0003) risks overfitting the params to one scene — the
+  best config should be validated on the other bursts (0000–0004, 0050) before
+  trusting it. The harness takes any `--burst/--canon`, so this is a follow-up.
+- **DISTS at Canon res downsamples the (larger) scale-2 output**, which smooths
+  it; ranking across configs is still valid but absolute DISTS is conservative.
+
+## Environment note
+
+- Installing `lpips`/`DISTS-pytorch` upgraded **torch 2.11 → 2.12** in the
+  `handheld` env. The pipeline still works; one unit test
+  (`test_gradient_cupy_matches_torch_sobel` at 4K) was relaxed to `atol=1e-3`
+  because torch 2.12 tiles large convolutions with a different float32 reduction
+  order (max diff ~5e-4, pure float noise).
+- CFA of this dataset is **GRBG**.
+
+## Sweep results (80 trials, burst 0003, scale 2, objective = DISTS vs Canon)
+
+| config | DISTS↓ | LPIPS↓ | PSNR | SSIM | sharp_ratio↑ |
+|---|---|---|---|---|---|
+| single-frame | 0.300 | — | — | — | — |
+| **default multi** | 0.291 | 0.313 | 23.4 | 0.803 | 0.062 |
+| **swept best** | **0.234** | **0.292** | 23.3 | 0.787 | **0.165** |
+
+Best config: DISTS **−19%** vs default and below single-frame (so multi-frame now
+*helps*); sharpness-vs-Canon **2.7×**. PSNR/SSIM dip slightly — expected, the
+result is sharper (those metrics favour blur). Visible win on the worst tiles
+(power lines / branches against sky go from mush to defined) — see
+`results/eval/final/worst_tile_default_vs_best_vs_canon.png`.
+
+Best params (`results/eval/sweep/best_config.yaml`) and what they say about the
+defaults being mistuned for a clean ISO-100 burst:
+
+| param | default | best | reading |
+|---|---|---|---|
+| `ica.tuning.n_iter` | 3 | **8** | more LK iterations → tighter sub-pixel alignment → less smearing |
+| `ica.tuning.sigma_blur` | 0 | 0.84 | mild pre-blur stabilises the gradient/alignment |
+| `robustness.tuning.t` | 0.12 | **0.43** | reject misaligned frames far more aggressively (the foliage lever) |
+| `robustness.tuning.Mt` | 0.8 | 0.20 | flag more flow-irregular tiles |
+| `merging.tuning.k_denoise` | 3.0 | 1.38 | much less denoising |
+| `merging.tuning.D_th` | 0.71 | ~0.00 | detail mode almost everywhere (default was denoise-biased) |
+| `merging.tuning.k_stretch` | 4.0 | ~1.0 | near-isotropic small kernels |
+| `merging.tuning.k_detail` | 0.25 | 0.18 | smaller (sharper) kernels, at the support floor |
+
+Takeaway: the stock defaults over-denoise and under-reject for low-ISO bursts;
+pushing toward detail-preservation + aggressive robustness recovers detail and
+makes fusion a net win. **Caveat:** tuned on one scene — validate across
+0000–0004/0050 (the harness takes any `--burst/--canon`) before adopting.

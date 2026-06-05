@@ -1,0 +1,5 @@
+# Extra dependencies for the eval/ harness (not needed to run the pipeline).
+# Installing these may upgrade torch (lpips/DISTS depend on it) -- see NOTES.md.
+optuna
+lpips
+DISTS-pytorch

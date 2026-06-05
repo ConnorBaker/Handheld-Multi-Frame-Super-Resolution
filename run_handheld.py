@@ -152,7 +152,7 @@ if __name__ == "__main__":
 
     if config.robustness.save_mask and debug_dict.get('accumulated robustness', None) is not None:
         n_images = len(glob.glob(os.path.join(args.impath, '*.dng')))
-        rob = debug_dict['accumulated robustness'].copy_to_host()/(n_images-1)
+        rob = np.asarray(debug_dict['accumulated robustness'])/(n_images-1)
         rob = np.repeat(rob[..., None], 3, axis=-1)
         # Upscale NN to output scale
         rob = cv2.resize(rob, (handheld_output.shape[1], handheld_output.shape[0]), interpolation=cv2.INTER_NEAREST)

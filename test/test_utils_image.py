@@ -167,8 +167,11 @@ def test_gradient_cupy_matches_torch_sobel(shape, seed):
     img = np.random.rand(*shape).astype(np.float32)
     gradx, grady = compute_gradient_cupy(img)
     ref_gradx, ref_grady = torch_sobel_ref(img)
-    assert np.allclose(cp.asnumpy(gradx), ref_gradx)
-    assert np.allclose(cp.asnumpy(grady), ref_grady)
+    # atol=1e-3: cupy correlate1d vs torch conv2d use different float32 reduction
+    # orders; at multi-megapixel sizes they diverge by ~5e-4 (float noise), more
+    # so on torch 2.12 which tiles large convolutions differently.
+    assert np.allclose(cp.asnumpy(gradx), ref_gradx, atol=1e-3)
+    assert np.allclose(cp.asnumpy(grady), ref_grady, atol=1e-3)
 
 
 @pytest.mark.parametrize("shape", [(128, 128), (512, 512), (1024, 1024), (2160, 3840)])

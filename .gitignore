@@ -163,3 +163,6 @@ numba_cache
 
 # test_bursts
 test_burst/
+
+# eval/sweep generated artifacts (large)
+results/
