@@ -51,14 +51,14 @@ def apply_optics(img, psf_sigma=0.0, psf_sigma_corner=None, ca_px=0.0):
             out = cv2.GaussianBlur(out, (0, 0), psf_sigma) * (1 - r) + \
                   cv2.GaussianBlur(out, (0, 0), cc) * r
     if ca_px and ca_px > 0:
-        out = np.ascontiguousarray(out)
         rmax = np.hypot((H - 1) / 2, (W - 1) / 2)
         m = ca_px / rmax  # per-unit-radius magnification so the corner shift = ca_px
-        for ch, sgn in ((0, +1.0), (2, -1.0)):  # R out, B in
+        for ch, sgn in ((0, +1.0), (2, -1.0)):  # R magnified out, B in
             s = 1.0 + sgn * m
             Mc = np.float32([[s, 0, (1 - s) * (W - 1) / 2],
                              [0, s, (1 - s) * (H - 1) / 2]])
-            out[..., ch] = cv2.warpAffine(out[..., ch], Mc, (W, H),
+            # warpAffine wants a contiguous 2D input -- the channel slice is strided
+            out[..., ch] = cv2.warpAffine(np.ascontiguousarray(out[..., ch]), Mc, (W, H),
                                           flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
     return np.clip(out, 0, 1).astype(np.float32)
 
