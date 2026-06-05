@@ -331,6 +331,7 @@ def process(burst_path, config):
                                            config.postprocessing.do_devignetting,
                                            xyz2cam,
                                            deblur_config=config.postprocessing.get("deblur", None),
+                                           aberration_config=config.postprocessing.get("aberration", None),
                                            )
     else:
         output_image = cp.asnumpy(handheld_output)

@@ -57,6 +57,19 @@ postprocessing:
     remove_halo: true     # suppress deblur halos at strong edges
     prefiltering: true    # base/detail split to limit noise amplification
     edgetaping: true
+  aberration:             # Stage B: per-tile (spatially-varying) deblur + learned defringe (vendored)
+    enabled: false        # OFF by default; takes precedence over deblur/sharpening when on
+    model_type: super_tiny
+    patch_size: 400
+    overlap: 0.25
+    batch_size: 20
+    ker_size: 31
+    alpha: 3              # per-tile deconvolution strength (mid)
+    beta: 3               # per-tile deconvolution strength (high)
+    c: 0.416              # Polyblur blur-model slope
+    sigma_b: 0.358        # Polyblur blur-model intercept
+    do_deblur: true
+    do_defringe: true
   do_devignetting: false
 
 accumulated_robustness_denoiser: 

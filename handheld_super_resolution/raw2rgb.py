@@ -236,9 +236,40 @@ def _deblur(img, deblur_config):
     return out.squeeze(0).permute(1, 2, 0).contiguous().cpu().numpy()
 
 
+_ABERRATION_MODEL = None
+
+
+def _aberration(img, cfg):
+    """Two-stage optical-aberration correction on linear-RGB HWC in [0, 1]:
+    per-tile (spatially-varying) Polyblur deblur + a learned ResUNet chromatic
+    defringer. Vendored from teboli/fast_two_stage_psf_correction (MIT). The model
+    (with its checkpoint) is cached across calls, keyed on its build parameters.
+    """
+    import torch
+    from .aberration import AberrationCorrection
+
+    global _ABERRATION_MODEL
+    key = (cfg.get("model_type", "super_tiny"), int(cfg.get("patch_size", 400)),
+           float(cfg.get("overlap", 0.25)), int(cfg.get("batch_size", 20)),
+           int(cfg.get("ker_size", 31)))
+    if _ABERRATION_MODEL is None or _ABERRATION_MODEL[0] != key:
+        _ABERRATION_MODEL = (key, AberrationCorrection(
+            model_type=key[0], patch_size=key[1], overlap=key[2],
+            batch_size=key[3], ker_size=key[4]).cuda())
+    model = _ABERRATION_MODEL[1]
+
+    t = torch.as_tensor(np.ascontiguousarray(img), dtype=torch.float32, device="cuda")
+    t = t.permute(2, 0, 1).unsqueeze(0).clamp(0.0, 1.0)  # (1, 3, H, W)
+    out = model(t, c=float(cfg.get("c", 0.416)), sigma_b=float(cfg.get("sigma_b", 0.358)),
+                alpha=float(cfg.get("alpha", 3.0)), b=float(cfg.get("beta", 3.0)),
+                do_deblur=bool(cfg.get("do_deblur", True)),
+                do_defringe=bool(cfg.get("do_defringe", True)))
+    return out.squeeze(0).permute(1, 2, 0).contiguous().cpu().numpy()
+
+
 def postprocess(raw, img=None, do_color_correction=True, do_tonemapping=True,
                 do_gamma=True, sharpening_config=None, do_devignette=False, xyz2cam=None,
-                deblur_config=None):
+                deblur_config=None, aberration_config=None):
     """
     Convert a raw image to jpg image.
     """
@@ -253,8 +284,10 @@ def postprocess(raw, img=None, do_color_correction=True, do_tonemapping=True,
             cam2rgb = np.linalg.inv(rgb2cam)
             img = apply_ccm(img, cam2rgb)
             img = np.clip(img, 0.0, 1.0)
-        ## Deblur (Polyblur) or sharpen -- mutually exclusive; deblur takes precedence
-        if deblur_config is not None and deblur_config.enabled:
+        ## Aberration (Stage B) > deblur (Stage A) > sharpen -- mutually exclusive
+        if aberration_config is not None and aberration_config.enabled:
+            img = _aberration(img, aberration_config)
+        elif deblur_config is not None and deblur_config.enabled:
             img = _deblur(img, deblur_config)
         elif sharpening_config is not None and sharpening_config.enabled:
             if "radius" in sharpening_config and "amount" in sharpening_config:
