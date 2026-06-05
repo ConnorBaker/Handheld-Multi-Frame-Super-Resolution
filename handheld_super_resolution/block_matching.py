@@ -9,14 +9,19 @@ from .utils import clamp, DEFAULT_NUMPY_FLOAT_TYPE, DEFAULT_CUDA_FLOAT_TYPE, DEF
 from .cupy_ops import block_matching_l1_cupy, to_torch
 FLOAT = DEFAULT_NUMPY_FLOAT_TYPE
 
-BOX_FILTER_8 = torch.as_tensor(np.ones((1,1,8,8)), dtype=DEFAULT_TORCH_FLOAT_TYPE, device="cuda")
-BOX_FILTER_8.requires_grad = False
-BOX_FILTER_16 = torch.as_tensor(np.ones((1,1,16,16)), dtype=DEFAULT_TORCH_FLOAT_TYPE, device="cuda")
-BOX_FILTER_16.requires_grad = False
-BOX_FILTER_32 = torch.as_tensor(np.ones((1,1,32,32)), dtype=DEFAULT_TORCH_FLOAT_TYPE, device="cuda")
-BOX_FILTER_32.requires_grad = False
-BOX_FILTER_64 = torch.as_tensor(np.ones((1,1,64,64)), dtype=DEFAULT_TORCH_FLOAT_TYPE, device="cuda")
-BOX_FILTER_64.requires_grad = False
+# Cached ones kernels for the windowed L2 norm in L2 block matching. Generalized
+# to ANY tile size (was hard-coded to {8,16,32,64}, which forced patch size into
+# that set and broke tile_sizes whose last level was e.g. 4).
+_BOX_FILTERS = {}
+
+
+def _box_filter(tile_size):
+    if tile_size not in _BOX_FILTERS:
+        bf = torch.ones((1, 1, tile_size, tile_size),
+                        dtype=DEFAULT_TORCH_FLOAT_TYPE, device="cuda")
+        bf.requires_grad = False
+        _BOX_FILTERS[tile_size] = bf
+    return _BOX_FILTERS[tile_size]
 
 def align_lvl_block_matching_L2(tyled_pyr_lvl, ref_fft_lvl, moving_lvl, alignment, l, config):
     verbose = config.verbose > 2
@@ -46,17 +51,8 @@ def align_lvl_block_matching_L2(tyled_pyr_lvl, ref_fft_lvl, moving_lvl, alignmen
 
 
     ## Now compute the windows L2 norm of the search patches
-    if tileSize == 8:
-        box_filter = BOX_FILTER_8
-    elif tileSize == 16:
-        box_filter = BOX_FILTER_16
-    elif tileSize == 32:
-        box_filter = BOX_FILTER_32
-    elif tileSize == 64:
-        box_filter = BOX_FILTER_64
-    else:
-        raise NotImplementedError("Box filter for tile size {} not implemented".format(tileSize))
-    
+    box_filter = _box_filter(tileSize)
+
     # TODO there may be a faster and smarter way than conv2d for this, but this is not the bottleneck so far
     L2_search = torch.nn.functional.conv2d(
         search_area.view(-1, 1, search_size, search_size).square(), box_filter, padding="valid")

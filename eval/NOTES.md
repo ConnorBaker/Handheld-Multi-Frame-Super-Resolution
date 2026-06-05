@@ -142,3 +142,54 @@ Bottom line: trust `eval/synthetic.py` (fidelity vs known GT) over the
 Canon-DISTS sweep. The pipeline works; the defaults over-denoise low-ISO; the
 sweep "win" was metric-gaming; the real detail ceiling is mostly the phone
 optics/sensor + the Bayer/merge reconstruction, not a fixable parameter.
+
+## Follow-up (items 1-3): fidelity sweep, independence, patch/robustness
+
+### Item 1 — fidelity-anchored, multi-scene sweep (`eval/sweep_synthetic.py`)
+Objective = mean over 3 scenes of 0.5*(1-SSIM)+0.5*DISTS vs SYNTHETIC GT
+(un-gameable: anchored to truth). default loss 0.104 (SSIM 0.926, DISTS 0.133,
+sharp/gt 0.53) -> best 0.071 (SSIM 0.935, DISTS 0.077, **sharp/gt 0.78 — still
+< 1, no over-sharpening**, unlike the Canon sweep which hit sharp/gt > 1 + 4.9x
+sky noise). Best params: `ica.n_iter` 3->6, `robustness.t` 0.12->0.31,
+`k_denoise` 3->0.72, **`D_th` kept high (0.84)**, `k_detail` ~default (0.26),
+`k_stretch` ~1.2. ⇒ the real win is **alignment + moderate rejection**, NOT
+killing denoise / over-sharpening. Far more defensible than the Canon "best".
+Saved: `results/eval/sweep_synth/best_config.yaml`.
+
+### Item 2 — independent GT + forward-model sensitivity (`eval/groundtruth.py`)
+GT from the Canon **RAW (CR2 via rawpy)**, not the JPEG. Across four downsample
+forward models, default-config results vs GT:
+
+| forward model | multi PSNR/SSIM/DISTS | single | bilinear |
+|---|---|---|---|
+| area     | 38.3 / .947 / .116 | 35.2 / .930 / .149 | 33.4 / .926 / .164 |
+| bicubic  | 38.3 / .947 / .109 | 35.3 / .930 / .141 | 33.5 / .926 / .158 |
+| lanczos  | 38.3 / .947 / .109 | 35.1 / .929 / .143 | 33.4 / .925 / .160 |
+| gaussian | 34.6 / .935 / .138 | 33.1 / .921 / .166 | 32.0 / .917 / .177 |
+
+multi > single > bilinear for EVERY model and metric ⇒ the "multi-frame SR
+genuinely recovers detail" conclusion is **not circular** (independent of GT
+source and forward model).
+
+### Item 3 — patch size + robustness (`eval/diagnostics.py`, `block_matching.py`)
+- Generalized the L2 box filter to **any tile size** (was hard-coded {8,16,32,64}).
+- Patch size on static high-freq GT: tile **16 (default) best** PSNR 38.31 vs
+  37.9 (tile 8/12); smaller → marginally more sharpness, less fidelity. Patch
+  size is NOT the lever for static fine detail. (tile 24/32 fail only because the
+  512-px synthetic LR is too small for the coarsest pyramid level — image-size,
+  not box-filter, limit.)
+- **Robustness under-rejects motion** (the real foliage lever): injecting an
+  independently-moving center region (per-frame 30-px-shifted content), it is
+  accepted **4.6/7 frames vs 6.2/7 static** — only ~25% down-weighted, so clearly
+  inconsistent content still gets ~66% weight ⇒ ghosting/smear. The local-mean
+  robustness is weak when moving content shares color statistics; `robustness.t`
+  is the lever (fidelity sweep chose 0.31 vs default 0.12).
+
+### Net correction to earlier claims
+- Pipeline + port: **correct** (multi-frame SR beats baselines vs true GT across
+  forward models). Earlier real-data "multi < single" was over-denoising clean
+  ISO-100 + the unreliable Canon metric, not a bug.
+- The Canon-DISTS sweep "best" was **over-claimed** (metric-gamed, over-sharpens).
+  The fidelity sweep's config is the defensible one; the biggest real lever is
+  **alignment iterations + robustness rejection**, not the merge kernel or patch
+  size.
