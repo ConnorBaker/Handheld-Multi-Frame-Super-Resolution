@@ -270,6 +270,11 @@ def merge_accumulate_cupy(comp_img, alignments, covs, r, bayer_mode, iso_kernel,
         _wp(cfa_pattern, cp.int32), _wp(num, cp.float32), _wp(den, cp.float32),
         int(lr_h), int(lr_w), int(np_y), int(np_x), int(cov_h), int(cov_w)],
         device=_wp_device(num))
+    # The merge's per-output-pixel read-modify-write into num/den runs on Warp's
+    # private CUDA stream; without this sync it races default-stream (cupy/torch)
+    # work on the shared accumulators and the output is nondeterministic (~0.18/px,
+    # verified). See REFACTORING_PLAN.md "align/merge nondeterminism".
+    wp.synchronize_device()
     return num, den
 
 
@@ -292,4 +297,9 @@ def merge_ref_accumulate_cupy(ref_img, covs, bayer_mode, iso_kernel, scale,
         int(robustness_denoise), int(max_frame_count), int(rad_max), float(max_multiplier),
         int(lr_h), int(lr_w), int(cov_h), int(cov_w), int(accr_h), int(accr_w)],
         device=_wp_device(num))
+    # The merge's per-output-pixel read-modify-write into num/den runs on Warp's
+    # private CUDA stream; without this sync it races default-stream (cupy/torch)
+    # work on the shared accumulators and the output is nondeterministic (~0.18/px,
+    # verified). See REFACTORING_PLAN.md "align/merge nondeterminism".
+    wp.synchronize_device()
     return num, den

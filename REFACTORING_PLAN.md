@@ -138,18 +138,24 @@ Guard: type-checking is additive (no runtime change); suite stays green.
 3. For any "faster"/"simpler" claim: a measured before/after on this machine.
 4. For any API claim: a compiled/run probe, not a doc citation (CLAUDE.md §1).
 
-## Known robustness issue (verified) — align/merge nondeterminism
+## align/merge nondeterminism — ROOT-CAUSED & FIXED
 
-The multi-frame path is **not deterministic for fixed input**: reconstructing the
-*same* fixed-seed synthetic burst multiple times yields outputs that differ by up
-to **~0.15–0.19 per pixel** (on a [0,1] scale) and ~0.8–1 dB PSNR — far above
-float-rounding noise (~1e-5). The single-frame and bilinear baselines are exactly
-reproducible, so the source is the alignment/merge, not the inputs. Mechanism is
-most likely a nondeterministic reduction/conv order flipping a near-tie argmin in
-block matching (a *discrete* alignment change that then propagates). It is **not**
-fixed by `torch.use_deterministic_algorithms` (the wobble is in the cupy/Warp ops,
-not just torch). `test/test_reconstruction_accuracy.py` documents and tolerates it
-(best-of-N for the capability claim + a median floor to keep it visible).
-The PR 3 alignment work should investigate: deterministic tie-breaking in
-`block_matching_l1_cupy`'s argmin, and deterministic reductions, then assert
-run-to-run output equality on a fixed input as a new regression test.
+The multi-frame path was not deterministic for fixed input: the same fixed-seed
+burst reconstructed run-to-run differed by ~0.18/px and ~1 dB PSNR. Diagnosed
+empirically (not assumed): it was **NOT** an unseeded RNG and **NOT** argmin
+tie-flips / reduction order — the alignment flow is bit-identical across runs and
+every stage is deterministic in isolation; seeding and
+`torch.use_deterministic_algorithms` both leave it unchanged. The cause is a
+**Warp merge cross-stream race**: the merge's per-output-pixel read-modify-write
+into the shared `num`/`den` accumulators runs on Warp's private CUDA stream, with
+no ordering against the cupy/torch default-stream work on those buffers. Proof: a
+sync *after* each merge makes the output bit-identical (0.0 diff) while a sync
+*before*, or only at the end, does not.
+
+**Fixed** by `wp.synchronize_device()` after each launch in `warp_ops.py`
+(verified: 0.0 run-to-run diff; ~negligible e2e cost since the merges already
+serialize through the shared accumulators; and PSNR lands at the top of the prior
+range, ~37.2 dB — the race had been *corrupting* the accumulation). Guarded by
+`test_reconstruction_deterministic`. Possible perf follow-up: launch the merge on
+cupy's current stream instead of a host-side device sync (needs its own
+stream-topology verification before adopting).
