@@ -2,13 +2,9 @@
 
 Each CuPy implementation is checked against a reference:
 
-* "always run" tests compare against a numba-free reference (torch / numpy).
-  These are the meaningful equivalences and stay green on GPUs where numba's
-  CUDA target cannot JIT.
-* "requires_numba" tests compare against the original numba kernels. They are
-  skipped automatically when numba cannot compile on the current GPU (e.g. a
-  ptxas / PTX-version mismatch), so the suite is green there too, but they still
-  verify the ports against the originals on numba-capable hardware.
+Each CuPy implementation is checked against a numba-free reference (torch / numpy)
+-- the meaningful equivalences, which stay green on GPUs where numba's CUDA target
+cannot JIT.
 """
 
 import math
@@ -29,32 +25,6 @@ from handheld_super_resolution.utils_image import (
     compute_hessian_cupy,
 )
 
-
-def _numba_cuda_works():
-    """True if numba can actually JIT and launch a trivial CUDA kernel here."""
-    from numba import cuda
-
-    try:
-
-        @cuda.jit
-        def _probe(a):
-            i = cuda.grid(1)
-            if i < a.size:
-                a[i] = a[i]
-
-        d = cuda.to_device(np.zeros(4, np.float32))
-        _probe[1, 4](d)
-        cuda.synchronize()
-        return True
-    except Exception:
-        return False
-
-
-NUMBA_OK = _numba_cuda_works()
-requires_numba = pytest.mark.skipif(
-    not NUMBA_OK,
-    reason="numba CUDA cannot JIT on this GPU (ptxas rejects the emitted PTX version)",
-)
 
 IMAGE_SHAPES = [(64, 64), (256, 256), (512, 512), (1024, 1024), (2160, 3840)]
 SEEDS = [0, 1, 2]
@@ -106,22 +76,6 @@ def numpy_hessian_ref(gradx, grady, tile_size):
     out[..., 0, 1] = cross
     out[..., 1, 0] = cross
     return out
-
-
-def numba_hessian_ref(gradx, grady, tile_size):
-    """Launch the original numba ``ICA.compute_hessian`` kernel."""
-    from numba import cuda
-    from handheld_super_resolution.ICA import compute_hessian
-
-    h, w = gradx.shape
-    n_patch_y, n_patch_x = h // tile_size, w // tile_size
-    hessian = cuda.device_array((n_patch_y, n_patch_x, 2, 2), np.float32)
-    tpb = (16, 16)
-    bpg = (math.ceil(n_patch_x / 16), math.ceil(n_patch_y / 16))
-    compute_hessian[bpg, tpb](
-        cuda.to_device(gradx), cuda.to_device(grady), tile_size, hessian
-    )
-    return hessian.copy_to_host()
 
 
 # --------------------------------------------------------------------------
@@ -187,29 +141,3 @@ def test_hessian_cupy_matches_numpy(shape, seed, tile_size):
     assert np.allclose(got, ref, rtol=1e-4)
 
 
-# --------------------------------------------------------------------------
-# cupy vs original numba kernels (skipped when numba cannot JIT here)
-# --------------------------------------------------------------------------
-@requires_numba
-@pytest.mark.parametrize("shape", [(256, 256), (512, 512), (2160, 3840)])
-@pytest.mark.parametrize("seed", SEEDS)
-def test_grey_decimate_cupy_matches_numba(shape, seed):
-    np.random.seed(seed)
-    img = np.random.rand(*shape).astype(np.float32)
-    got = cp.asnumpy(compute_grey_images_decimate_cupy(img))
-    ref = compute_grey_images(img, "decimating").copy_to_host()
-    assert got.shape == ref.shape
-    assert np.allclose(got, ref)
-
-
-@requires_numba
-@pytest.mark.parametrize("shape", [(128, 128), (512, 512), (1024, 1024)])
-@pytest.mark.parametrize("tile_size", TILE_SIZES)
-def test_hessian_cupy_matches_numba(shape, tile_size):
-    np.random.seed(0)
-    gradx = np.random.rand(*shape).astype(np.float32)
-    grady = np.random.rand(*shape).astype(np.float32)
-    got = cp.asnumpy(compute_hessian_cupy(gradx, grady, tile_size))
-    ref = numba_hessian_ref(gradx, grady, tile_size)
-    assert got.shape == ref.shape
-    assert np.allclose(got, ref, rtol=1e-4)

@@ -10,7 +10,6 @@ where the merge kernels are estimated
 """
 
 import time
-import math
 
 import numpy as np
 from numba import cuda
@@ -19,9 +18,8 @@ import torch.nn.functional as F
 
 import cupy as cp
 
-from .linalg import get_eigen_elmts_2x2
-from .utils import clamp, DEFAULT_CUDA_FLOAT_TYPE, DEFAULT_NUMPY_FLOAT_TYPE, DEFAULT_TORCH_FLOAT_TYPE, DEFAULT_THREADS, getTime, timer
-from .utils_image import compute_grey_images, GAT, compute_grey_images_decimate_cupy
+from .utils import DEFAULT_TORCH_FLOAT_TYPE
+from .utils_image import compute_grey_images_decimate_cupy
 from .cupy_ops import gat_cupy, estimate_cov_cupy, to_torch
 
 
@@ -54,8 +52,6 @@ def estimate_kernels(img, config):
     bayer_mode = config.mode=='bayer'
     verbose_3 = config.verbose >= 3
 
-    GAT_ = timer(GAT, verbose_3, end_s="- Variance Stabilized")
-    compute_grey_images_ = timer(compute_grey_images, verbose_3, end_s="- Decimated Image")
 
     k_detail = config.merging.tuning.k_detail
     k_denoise = config.merging.tuning.k_denoise
@@ -108,110 +104,7 @@ def estimate_kernels(img, config):
                              k_stretch, k_shrink, selection_law)
     return covs
 
-@cuda.jit
-def cuda_estimate_kernel(full_grads,
-                         k_detail, k_denoise,
-                         D_th, D_tr,
-                         k_stretch, k_shrink,
-                         covs,
-                         selection_law):
-    pixel_idx, pixel_idy = cuda.grid(2)
-    imshape_y, imshape_x, _, _ = covs.shape
-
-    if not(0 <= pixel_idy < imshape_y and
-           0 <= pixel_idx < imshape_x) :
-        return
-    
-    structure_tensor = cuda.local.array((2, 2), DEFAULT_CUDA_FLOAT_TYPE)
-    structure_tensor[0, 0] = 0
-    structure_tensor[0, 1] = 0
-    structure_tensor[1, 0] = 0
-    structure_tensor[1, 1] = 0
-    
-
-    for i in range(0, 2):
-        for j in range(0, 2):
-            x = pixel_idx - 1 + j
-            y = pixel_idy - 1 + i
-            
-            if (0 <= y < full_grads.shape[0] and
-                0 <= x < full_grads.shape[1]):
-                
-                full_grad_x = full_grads[y, x, 0]
-                full_grad_y = full_grads[y, x, 1]
-
-                structure_tensor[0, 0] += full_grad_x * full_grad_x
-                structure_tensor[1, 0] += full_grad_x * full_grad_y
-                structure_tensor[0, 1] += full_grad_x * full_grad_y
-                structure_tensor[1, 1] += full_grad_y * full_grad_y
-    
-    l = cuda.local.array(2, dtype=DEFAULT_CUDA_FLOAT_TYPE)
-    e1 = cuda.local.array(2, dtype=DEFAULT_CUDA_FLOAT_TYPE)
-    e2 = cuda.local.array(2, dtype=DEFAULT_CUDA_FLOAT_TYPE)
-    k = cuda.local.array(2, dtype=DEFAULT_CUDA_FLOAT_TYPE)
-
-    get_eigen_elmts_2x2(structure_tensor, l, e1, e2)
-
-    compute_k(l[0], l[1], k, k_detail, k_denoise, D_th, D_tr, k_stretch,
-    k_shrink, selection_law)
-
-    k_1_sq = k[0]*k[0]
-    k_2_sq = k[1]*k[1]
-    
-    covs[pixel_idy, pixel_idx, 0, 0] = k_1_sq*e1[0]*e1[0] + k_2_sq*e2[0]*e2[0]
-    covs[pixel_idy, pixel_idx, 0, 1] = k_1_sq*e1[0]*e1[1] + k_2_sq*e2[0]*e2[1] 
-    covs[pixel_idy, pixel_idx, 1, 0] = k_1_sq*e1[0]*e1[1] + k_2_sq*e2[0]*e2[1]
-    covs[pixel_idy, pixel_idx, 1, 1] = k_1_sq*e1[1]*e1[1] + k_2_sq*e2[1]*e2[1]
 
     
-@cuda.jit(device=True)
-def compute_k(l1, l2, k, k_detail, k_denoise, D_th, D_tr, k_stretch, k_shrink, selection_law):
-    """
-    Computes k_1 and k_2 based on lambda1, lambda2 and the constants.
 
-    Parameters
-    ----------
-    l1 : float
-        lambda1 (dominant eigen value)
-    l2 : float
-        lambda2 : second eigenvalue
-    k : Array[2]
-        empty vector where k_1 and k_2 will be stored
-    k_detail : float
-    k_denoise : float
-    D_th : float
-    D_tr : float
-    k_stretch : float
-    k_shrink : float
-        Parameters to compute k_1 and k_2, all detailed in the article.
-        
-
-
-    """
-    A = 1 + math.sqrt((l1 - l2)/(l1 + l2))
-    D = clamp(1 - math.sqrt(l1)/D_tr + D_th, 0, 1)
-
-    if selection_law == SEL_HARD_THRESHOLD:
-        k1, k2 = hard_threshold(A, k_shrink, k_stretch)
-    else: # LINEAR
-        k1, k2 = linear(A, k_shrink, k_stretch)
-    
-    k[0] = k_detail * ((1-D)*k1 + D*k_denoise)
-    k[1] = k_detail * ((1-D)*k2 + D*k_denoise)
-
-@cuda.jit(device=True)
-def hard_threshold(A, k_shrink, k_stretch):
-    if A > 1.95:
-        k1 = 1/k_shrink
-        k2 = k_stretch
-    else: # When A is Nan, we fall back to this condition
-        k1 = 1
-        k2 = 1
-    return k1, k2
-
-@cuda.jit(device=True)
-def linear(A, k_shrink, k_stretch):
-    k1 = 1 + A/2 * (1/k_shrink - 1)
-    k2 = 1 + A/2 * (k_stretch - 1)
-    return k1, k2
 

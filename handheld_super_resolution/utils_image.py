@@ -148,60 +148,7 @@ def compute_grey_images_decimate_cupy(img):
     img = img[:2 * (h // 2), :2 * (w // 2)]
     return (img[0::2, 0::2] + img[1::2, 0::2] + img[0::2, 1::2] + img[1::2, 1::2]) / 4
 
-def GAT(image, alpha, beta):
-    """
-    Generalized Ascombe Transform
-    noise model : std² = alpha * I + beta
-    Where alpha and beta are iso dependant. 
 
-    Parameters
-    ----------
-    image : TYPE
-        DESCRIPTION.
-    alpha : float
-        value of alpha for the given iso 
-    iso : float
-        ISO value
-    beta : float
-        Value of beta for the given iso
-
-    Returns
-    -------
-    VST_image : TYPE
-        input image with stabilized variance
-
-    """
-    assert len(image.shape) == 2
-    assert alpha > 0, f"alpha should be positive, got {alpha} (VST is ill defined and kernels would be wrong)"
-    imshape_y, imshape_x = image.shape
-    
-    VST_image = cuda.device_array(image.shape, DEFAULT_NUMPY_FLOAT_TYPE)
-
-    threadsperblock = (DEFAULT_THREADS, DEFAULT_THREADS)
-    blockspergrid_x = math.ceil(imshape_x/threadsperblock[1])
-    blockspergrid_y = math.ceil(imshape_y/threadsperblock[0])
-    blockspergrid = (blockspergrid_x, blockspergrid_y)
-    
-    cuda_GAT[blockspergrid, threadsperblock](image, VST_image,
-                                             alpha, beta)
-    
-    return VST_image
-
-@cuda.jit
-def cuda_GAT(image, VST_image, alpha, beta):
-    x, y = cuda.grid(2)
-    imshape_y,  imshape_x = image.shape
-    
-    if not (0 <= y < imshape_y and
-            0 <= x < imshape_x):
-        return
-    
-    # ISO should not appear here,  since alpha and beta are
-    # already iso dependant.
-    VST = alpha*image[y, x] + 3/8 * alpha*alpha + beta
-    VST = max(0, VST)
-    
-    VST_image[y, x] = 2/alpha * math.sqrt(VST)
     
     
 
@@ -342,53 +289,13 @@ def bubble_sort(X):
             if X[j] > X[j+1]:
                 X[j], X[j+1] = X[j+1], X[j]
                 
-@cuda.jit(device=True)
-def denoise_power_merge(r_acc, power_max, max_frame_count):
-    if r_acc <= max_frame_count:
-        return power_max
-    else:
-        return 1
     
-@cuda.jit(device=True)
-def denoise_range_merge(r_acc, rad_max, max_frame_count):
-    rad_min = 1 # 3 by 3 window
-    
-    if r_acc <= max_frame_count:
-        return rad_max
-    else:
-        return rad_min
     
 
             
                 
     
-def fft_lowpass(img_grey):
-    img_grey = th.from_numpy(img_grey).to("cuda")
-    img_grey = torch.fft.fft2(img_grey)
-    img_grey = torch.fft.fftshift(img_grey)
-    
-    imsize_y, imsize_x = img_grey.shape
-    img_grey[:imsize_y//4, :] = 0
-    img_grey[:, :imsize_x//4] = 0
-    img_grey[-imsize_y//4:, :] = 0
-    img_grey[:, -imsize_x//4:] = 0
-    
-    img_grey = torch.fft.ifftshift(img_grey)
-    img_grey = torch.fft.ifft2(img_grey)
-    return img_grey.cpu().numpy().real
 
-@cuda.jit
-def cuda_decimate_to_grey(img, grey_img):
-    x, y = cuda.grid(2)
-    grey_imshape_y, grey_imshape_x = grey_img.shape
-    
-    if (0 <= y < grey_imshape_y and
-        0 <= x < grey_imshape_x):
-        c = 0
-        for i in range(0, 2):
-            for j in range(0, 2):
-                c += img[2*y + i, 2*x + j]
-        grey_img[y, x] = c/4
         
 
 def cuda_downsample(th_img, kernel='gaussian', factor=2):
@@ -498,20 +405,6 @@ def compute_hessian_cupy(gradx, grady, tile_size):
     hessian[..., 1, 1] = gy2
     return hessian
 
-
-@cuda.jit(device=True)
-def dogson_biquadratic_kernel(x, y):
-    return dogson_quadratic_kernel(x) * dogson_quadratic_kernel(y)
-
-@cuda.jit(device=True)
-def dogson_quadratic_kernel(x):
-    abs_x = abs(x)
-    if abs_x <= 0.5:
-        return -2 * abs_x*abs_x +1
-    elif abs_x <= 1.5:
-        return abs_x*abs_x - 5/2 * abs_x + 1.5
-    else:
-        return 0
 
 def computeRMSE(image1, image2):
     '''computes the Root Mean Square Error between two images'''

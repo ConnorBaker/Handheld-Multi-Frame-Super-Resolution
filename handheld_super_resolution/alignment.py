@@ -1,15 +1,13 @@
 import time
-import math
 
 import numpy as np
-from handheld_super_resolution.linalg import bilinear_interpolation
 from numba import cuda
 import torch
 import torch.nn.functional as F
 
 from .ICA import init_ica, align_lvl_ica
 from .block_matching import align_lvl_block_matching_L2, align_lvl_block_matching_L1
-from .utils import getTime, clamp, DEFAULT_NUMPY_FLOAT_TYPE, DEFAULT_CUDA_FLOAT_TYPE, DEFAULT_TORCH_FLOAT_TYPE, DEFAULT_THREADS
+from .utils import getTime, DEFAULT_TORCH_FLOAT_TYPE
 from .utils_image import cuda_downsample
 
 SOBEL_Y = torch.as_tensor(np.array([[-1], [0], [1]]), dtype=DEFAULT_TORCH_FLOAT_TYPE, device="cuda")[None, None]
