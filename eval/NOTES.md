@@ -409,18 +409,34 @@ Gaussian needs >=10x at the frequencies it kills. Plus its blind sigma-estimate 
 fooled by high-contrast edges (large gradient -> small sigma^). So it caps at 2.07.
 
 **Result (RL beats Wiener -- less halo + far less noise gain):**
-| method | edge sigma | overshoot | flat noise |
+| method | edge sigma | flat noise | deslanted edge overshoot |
 |---|---|---|---|
-| DxO consensus (target) | 1.87 | 0.052 | 0.0005 |
-| our merge (raw) | 2.10 | - | 0.0015 |
-| Wiener full(s2.1) nsr=0.03 | 1.39 | 0.077 | 0.0021 (overshoots target, amplifies noise) |
-| **merge + RL deconv (sigma_r~1.1, 10 it)** | **1.88** | **0.008** | 0.0022 |
+| DxO consensus (target) | 1.87 | 0.0005 | 1.8% |
+| our merge (raw) | 2.10 | 0.0015 | 2.0% |
+| Wiener full(s2.1) nsr=0.03 | 1.39 | 0.0021 | (overshoots target + amplifies noise 2-4x) |
+| **merge + RL deconv (sigma_r~1.1, 3-10 it)** | **1.88-1.90** | 0.0020-0.0026 | 2.6% |
 
-So a measured-PSF Richardson-Lucy deconvolution takes the merge to **DxO's edge
-resolution (1.88 == 1.87) with ~6x LESS overshoot (0.008 vs 0.052)** and only a mild
-noise increase -- using only real detail. Net: DxO's sharper edges are reproducible
-from our merge by a principled deconvolution, WITHOUT DxO's ~28% per-frame texture
-invention. `deblur(img, deconv_sigma, method='rl')` wraps it;
-`test/test_deconv.py` guards the deconvolutions (CPU, torch.fft). NOT yet wired into
-the shipped pipeline (the deconv sigma needs per-camera/scale PSF calibration like
-`sigma_b`); `eval/_deconv_sweep.py` reproduces the sweep.
+A measured-PSF Richardson-Lucy deconvolution takes the merge to DxO's edge resolution
+(1.88 == 1.87) using only real detail (deterministic on the consensus merge -> adds
+no invention), at a deslanted edge overshoot ~2.6% (vs DxO 1.8%, raw merge 2.0% --
+comparable, NOT ringing; undershoot ~0.1%, RL being non-negative). Cost: a modest
+noise increase (0.0015 -> 0.0020 at the gentle iters=3 setting; fewer iters = less
+noise), still well below DxO's grain -- in a level-matched 1:1 render OUR column
+surface is SMOOTHER than DxO's (DxO adds the ~28% per-frame texture). So DxO's sharper
+edges are reproducible from our merge WITHOUT its invention and WITHOUT blockiness.
+
+Caveats learned the hard way (both were measurement/viz errors, not the method):
+- An earlier "overshoot 0.008, 6x less than DxO" claim was WRONG -- the
+  `_deconv_sweep` `overshoot()` helper averages a 1deg-slanted edge band and
+  dilutes/aliases the bump. The DESLANTED per-edge numbers above are the honest ones
+  (~2.6%).
+- A quick comparison viz used per-panel percentile-stretch + nearest-neighbor zoom,
+  which mapped +-0.001 flat-region noise across full black->white and FABRICATED
+  "blockiness" the merge does not have: at 1:1 flat patches are smooth and their FFT
+  is featureless (no ~16px tile-grid period; the merge's nearest flow-upscaling does
+  NOT show here). Render level-matched with a shared stretch + cubic zoom.
+
+`deblur(img, deconv_sigma, method='rl')` wraps it; `test/test_deconv.py` guards it
+(CPU, torch.fft). NOT yet wired into the shipped pipeline (the deconv sigma needs
+per-camera/scale PSF calibration like `sigma_b`); `eval/_deconv_sweep.py` reproduces
+the sweep.

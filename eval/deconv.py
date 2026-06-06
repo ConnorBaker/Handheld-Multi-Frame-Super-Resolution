@@ -106,8 +106,11 @@ def deblur(img, deconv_sigma, method="rl", iters=10, nsr=1e-2, clip=True):
     """Measured-PSF deblur: deconvolve a Gaussian of `deconv_sigma` from `img`
     (a (H,W) float tensor in [0,1]). method 'rl' (Richardson-Lucy -- gentler, less
     halo/noise; preferred here) or 'wiener'. On the facade merge, sigma_r~1.1 took
-    the edge 2.10->1.88 px (== DxO) at overshoot 0.008 (vs DxO 0.052), adding no
-    invention (it operates on the already-consensus merge). `iters`/`nsr` regularize."""
+    the edge 2.10->1.88 px (== DxO) at a fair DESLANTED edge overshoot ~2.6% vs DxO
+    ~1.8% / raw merge ~2.0% (comparable, not ringing), adding no invention (it
+    operates on the already-consensus merge). Use 3-5 iters for less noise gain;
+    `iters`/`nsr` regularize. (The slant-averaged overshoot() in _deconv_sweep
+    under-reports the bump -- deslant per-edge for an honest number.)"""
     psf = gaussian_psf(deconv_sigma)
     if method == "rl":
         return richardson_lucy_fft(img, psf, iters=iters, clip=clip)
