@@ -269,6 +269,15 @@ not used for the merge because the merge is a *gather*, not a matmul — a plain
 per-output Warp kernel fits it. Warp tiles would suit the tile-structured
 align/block-matching/Hessian ops if those are ever moved off torch.
 
+Warp **also has device-side FFT** — `wp.tile_fft` / `tile_ifft` (cuFFTDx via
+libmathdx, `enable_mathdx_fft=True`) plus `tile_matmul` (cuBLASDx) — same
+compile-time-builtin caveat (`dir(wp)`/`hasattr` miss them). Verified on the GB10
+by running Warp's shipped `example_tile_fft` (round-trips correctly, exit 0) and
+`example_tile_filtering`. So a fused on-device FFT Wiener/RL deconvolution is
+implementable in Warp (a "Warp has no FFT" note elsewhere would be WRONG). See the
+deconvolution section below; `eval/deconv.py` drives the actual deblur on
+`torch.fft` for now (full-frame 24 MP; the Warp path needs row/col tile decomp).
+
 ### Net correction to earlier claims
 - Pipeline + port: **correct** (multi-frame SR beats baselines vs true GT across
   forward models). Earlier real-data "multi < single" was over-denoising clean
@@ -372,3 +381,46 @@ measurement: merge edge sigma ≈ 2.1 px), not the current blind sigma_b.
 **Tooling:** the driver gained `--arw` (ARW and DNG in separate dirs), N-frame-aware
 montage/edge frame selection (28≠41 frames), a scene_map.npz cache, and a dead-flat
 ROI guard in `inconsistency_structure`.
+
+### Deconvolution — matching DxO's edge sharpness from the merge (`eval/deconv.py`)
+
+Follow-up to the facade-scene PSF result (merge edge ~sigma 2.10 px vs DxO 1.87).
+Since we MEASURED the merge PSF (~Gaussian sigma 2.1), a non-blind deconvolution can
+target it directly -- and it invents nothing: it is a deterministic operator on the
+merge, which already holds only cross-frame-consistent (real) detail. The risk is
+noise/ringing (bounded here, measured via overshoot + flat noise), not per-frame
+fabrication.
+
+**Conv/deconv backend survey (verified on the GB10; two meanings of "deconvolution"):**
+- *Transposed conv* (the deep-learning "deconv" upsampling layer): PyTorch
+  `nn.ConvTranspose2d` is built in; NOT an inverse filter.
+- *Inverse-filter deblur* (Wiener / Richardson-Lucy): none ships a turnkey 2-D
+  `deblur()`. PyTorch -> roll on `torch.fft`; CuPy `signal.deconvolve` is 1-D only
+  (`wiener` is a denoiser) -> roll on `cupy.fft`; **Warp HAS `wp.tile_fft`/`tile_ifft`
+  (cuFFTDx) + `tile_matmul`** -> a fused on-device Wiener/RL is implementable
+  (verified the FFT examples run on sm_121). Primary path here is `torch.fft` (full
+  24 MP frame); a separable-Gaussian Warp conv kernel is also provided + benchmarked
+  (agrees with scipy to ~1e-4).
+
+**Why Polyblur could not do this (it IS deconvolution, just bounded):** its
+`compute_polynomial_fft` is a rank-3 polynomial inverse `p(K)=a3 K^3+..+beta`; the
+high-frequency gain is capped at `p(0)=beta` (3x at default), but inverting a 2.1 px
+Gaussian needs >=10x at the frequencies it kills. Plus its blind sigma-estimate is
+fooled by high-contrast edges (large gradient -> small sigma^). So it caps at 2.07.
+
+**Result (RL beats Wiener -- less halo + far less noise gain):**
+| method | edge sigma | overshoot | flat noise |
+|---|---|---|---|
+| DxO consensus (target) | 1.87 | 0.052 | 0.0005 |
+| our merge (raw) | 2.10 | - | 0.0015 |
+| Wiener full(s2.1) nsr=0.03 | 1.39 | 0.077 | 0.0021 (overshoots target, amplifies noise) |
+| **merge + RL deconv (sigma_r~1.1, 10 it)** | **1.88** | **0.008** | 0.0022 |
+
+So a measured-PSF Richardson-Lucy deconvolution takes the merge to **DxO's edge
+resolution (1.88 == 1.87) with ~6x LESS overshoot (0.008 vs 0.052)** and only a mild
+noise increase -- using only real detail. Net: DxO's sharper edges are reproducible
+from our merge by a principled deconvolution, WITHOUT DxO's ~28% per-frame texture
+invention. `deblur(img, deconv_sigma, method='rl')` wraps it;
+`test/test_deconv.py` guards the deconvolutions (CPU, torch.fft). NOT yet wired into
+the shipped pipeline (the deconv sigma needs per-camera/scale PSF calibration like
+`sigma_b`); `eval/_deconv_sweep.py` reproduces the sweep.
