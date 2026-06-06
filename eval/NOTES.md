@@ -440,3 +440,58 @@ Caveats learned the hard way (both were measurement/viz errors, not the method):
 (CPU, torch.fft). NOT yet wired into the shipped pipeline (the deconv sigma needs
 per-camera/scale PSF calibration like `sigma_b`); `eval/_deconv_sweep.py` reproduces
 the sweep.
+
+### Adversarial review — verified corrections (deconvolution)
+
+A 3-agent adversarial pass + re-execution corrected several deconvolution claims
+(the `real_fraction`~0.72 hallucination result survived; the *global* deconv result
+did not). All re-verified on the cached merge/stack:
+
+- **The merge PSF is strongly FIELD-VARYING: edge sigma 0.91-2.41 px across the 8
+  found edges (median 1.88, std 0.53).** "merge ~2.10" was the SOFT right-side
+  cluster the reliability gate happens to select; center/left edges are much sharper.
+  => a SINGLE global deconv sigma is WRONG -- it over-sharpens the already-sharp
+  field. The correct design is FIELD-VARYING (per-tile), which the pipeline's
+  aberration (Stage B) per-tile Polyblur ALREADY is; the lever is to feed IT a
+  measured/calibrated PSF, not bolt on a global stage.
+- **Flat-noise is region-dependent (earlier "smoother than DxO" was misstated):**
+  flat SKY -- DxO 0.0005 << raw merge 0.0017 < merge+RL 0.0025 (DeepPRIME denoises
+  flats hard; the deconv makes flat noise WORSE). Textured COLUMN -- merge 0.0079 <
+  DxO 0.0115 (DxO adds invented grain there). Both true; always state the region.
+- **Overshoot is method-fragile and was reported too low.** Canonical deslanted ESF:
+  DxO ~15%, raw merge ~7%, merge+RL ~8% -- DxO HALOS MORE than us (we reach similar
+  sharpness with less halo), but the absolute "1.8%/2.6%" do NOT reproduce; trust
+  the direction, not the number.
+- **"Adds no invention" was too strong.** RL is nonlinear and shapes the merge's
+  (already nearest-flow-structured) flat noise (lag-1 autocorr 0.58->0.66); it stays
+  AT/BELOW the DxO cross-frame-real ceiling only at gentle settings (HF/consensus
+  0.98 @ it5, but 1.12 @ it10). Use few iters + a gate.
+- **Held up:** `real_fraction`~0.72 robust to tiling/registration/resampling/channel
+  (only scale-dependent: 0.68@hp1.0 -> 0.89@hp3.5; mildly pessimistic from an
+  untrimmed HF mean, ~0.77 robustified). The deconv DOES reach target on the soft
+  cluster, with less halo than DxO.
+
+### Avenues (verified)
+
+- **Noise-controlled deconv:** measured-PSF RL (few iters) + edge-preserving
+  bilateral -> edge sigma 1.84 at flat-sky noise 0.0016 (BELOW raw merge 0.0017)
+  while preserving column texture (0.0080 ~ plain RL 0.0082). The bilateral strips
+  only the noise the deconv amplified. TV-regularized RL is a smaller win.
+- **Edge gate = the STRUCTURE TENSOR, not the robustness mask.** Robustness is
+  frame-AGREEMENT (~constant on a static scene) -- wrong signal. The structure tensor
+  (l1 eigenvalue = across-edge energy = edge strength) is ALREADY computed per pixel
+  for the steerable kernels (`kernels.py` estimate_cov / `cupy_ops.py`). Verified
+  edge/flat contrast 6.8x; gate excludes ~85% (flat) of the frame. Gate by sqrt(l1).
+- **Params:** merge PSF sigma is DERIVABLE per burst (auto esf over found edges =
+  2.03; or per-camera calibration like sigma_b). sigma_r = ~1.08 *
+  partial_gaussian_sigma(merge_sigma, target) (the ~8% fudge is the non-Gaussian
+  edge; Gaussian model 1.02 -> 1.93, fudge 1.1 -> 1.88). HYPERparameters: iters/nsr,
+  method, denoise/gate strength; target sharpness is an external anchor. The
+  radial-frequency-falloff PSF estimate FAILS (confounded by the scene's own
+  f^-beta spectrum) -- ESF on edges is the estimator.
+- **Optuna:** extend `eval/sweep_synthetic.py` (synthetic-GT or DxO-consensus
+  fidelity anchor, NOT the gameable Canon-DISTS sweep `eval/sweep.py`). DERIVE
+  sigma_r (don't sweep). Sweep the few regularizers against a ONE-SIDED objective
+  w1*DISTS_vs_GT + w2*|edge_sigma-target| + w3*max(0,flat_noise-merge_noise) +
+  w4*max(0,overshoot-merge_overshoot) so it cannot win by over-sharpening/noise (the
+  failure that broke the old Canon-DISTS sweep).
