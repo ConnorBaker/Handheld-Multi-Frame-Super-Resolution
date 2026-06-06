@@ -544,3 +544,20 @@ sigma = 1.96, high-conf), and compared PHYSICAL edge resolution to DxO -- MATCHE
   target (coarse building edges can't isolate the SR gain) -- and that regime is
   exactly where DxO hallucinates, so the honest framing is real-detail vs
   invented-detail, not sharper-vs-softer.
+
+### Block artifact = fixed-tile (nearest) flow upscaling -- FIXED (default -> bilinear)
+
+The faint block artifact (visible at scale=2, amplified by the deconv; noticed
+across multiple outputs) is the merge's flow_upscale_mode=nearest: the per-tile
+optical flow was upsampled PIECEWISE-CONSTANT, so tile-boundary flow discontinuities
+cut a tile grid into the merge. Confirmed by A/B (eval/_flow_ab.py): the
+nearest-vs-bicubic difference is RMS 0.013 (maxabs 0.10) and STRONGLY periodic
+(peak/mean 215) -- the 20x difference image is literally the tile grid. This is the
+fixed-tile discretization; the fix is a CONTINUOUS flow field.
+
+Default flow_upscale_mode nearest -> bilinear: block residual halved (bilinear-vs-
+bicubic 0.0062 vs nearest-vs-bicubic 0.0129), edge sharpness preserved/improved
+(phys sigma 2.14 vs 2.17; edge-fit rms 0.009 vs 0.017 -- the blocks were corrupting
+the fit), full suite 230 passed. bicubic is marginally smoother (C1) but risks flow
+overshoot at motion/depth boundaries, so bilinear is the safe default. A concrete
+step toward the continuous formulation (continuous flow vs piecewise-constant tiles).
