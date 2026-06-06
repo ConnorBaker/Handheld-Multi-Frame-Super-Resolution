@@ -619,3 +619,46 @@ Research S6 (continuous HF recovery): registration precision + continuous flow
 (highest confidence), field-varying PSF inverse + B-spline resample, adaptive-
 bandwidth/N=1 kernel regression, frequency-domain (Papoulis-Gerchberg) de-aliasing
 -- recover HF the pipeline currently WASTES; none beats the optics sampling-ratio cap.
+
+### Adversarial pass on the 3 continuous HF-recovery directions: all KILLED/bounded (executed)
+
+Tried HARD to kill each (3 parallel adversarial subagents: online research + executed
+probes -- synthetic-GT anchors, a merge validated bit-for-bit vs the Warp merge,
+condition-number curves, real-data HF coherence). All three fail or are tightly
+bounded on THIS pipeline/data:
+
+1. CONTINUOUS PER-PIXEL FLOW -- NO (net-NEGATIVE). The 26% high-residual tile tail is
+   ILL-POSED (87% aperture-problem edges; rest depth/parallax/occlusion -> Fisher info
+   singular on edges), not a precision problem. More ICA iters make it WORSE (LK
+   overfits noise past ~3 -- why Wronski ships 3). Per-pixel LK on noisy raw injects
+   7-44px jitter; end-to-end SR vs synthetic GT is 1.5-6.8 dB WORSE at every
+   regularization. Real lever = ROBUSTNESS REJECTION of the unalignable tail (Wronski's
+   mechanism; the fidelity sweep already favored robustness.t 0.12->0.31), NOT flow.
+2. ADAPTIVE-BANDWIDTH / N=1 KERNEL REGRESSION -- NO (bias-variance DIAL, not detail).
+   Synthetic-GT decomposition: real HF flat (11% spread) across 10 operating points,
+   noise 3x spread (one frontier). Corroborated on the real burst: k_detail 0.25->0.18
+   raised flat-sky NOISE 1.36x vs textured HF only 1.09x. N=1 amplifies noise ~5x and
+   CONVERGES EXACTLY to N=0 once regularized (Takeda equivalent-kernels, executed);
+   Bayer color speckle in sparse R/B. CORRECTION: my earlier "k_detail 0.18 -> +48% HF"
+   lever is mostly NOISE.
+3. FREQUENCY-DOMAIN DE-ALIASING -- NO (dies on real). Ideal point-sampler/exact-shift/
+   no-noise: ~50 dB (algebra real). Dies on: pixel APERTURE box-MTF null near Nyquist
+   (Baker-Kanade: box PSF "not even invertible"), <4% aliasing in real content
+   (already AA'd), registration/local-motion mismatch (PSNR 35.7->13.8 at 0.3px; <0 vs
+   single at 0.2px). Real-data HF coherence 0.48 FALLING with displacement -> motion/
+   misreg, not exploitable aliasing. Field abandoned it; BurstM = learned hybrid +0.17 dB.
+   Salvage: freq-domain registration CHECK (diagnostic), not a reconstruction stage.
+
+WHY ALL THREE (convergent): (a) OPTICS ceiling -- edges need DECONVOLUTION, not SR/
+flow/kernel/freq; (b) real content already ~anti-aliased (little aliasing; sampling
+ratio 1.5-1.8 < 2.0); (c) binding constraint is registration ACCURACY + REJECTION of
+the unalignable, not the kernel/domain; (d) on noisy raw every sharpening lever
+amplifies noise faster than real detail. CORRECTION 2: "scale=2 SR-band power 7.5-9.7x"
+is partly registration-jitter HF (reg error PUMPS SR-band power); the CLEAN proof SR
+works is the synthetic-GT +3 dB.
+
+SURVIVES (honest path): (1) measured-PSF DECONVOLUTION for edges (optical MTF; have it,
+opt-in); (2) tighter ROBUSTNESS REJECTION (robustness.t up) for the unalignable tail;
+(3) freq-domain registration CHECK as a diagnostic. The pipeline already extracts ~all
+the real HF the samples hold (matches ~77% real-fraction + optics ceiling); a genuine
+SR out-resolve needs sub-Nyquist chart content that natural AA'd scenes lack.

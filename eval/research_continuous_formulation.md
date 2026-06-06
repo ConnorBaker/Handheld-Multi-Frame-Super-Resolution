@@ -850,3 +850,15 @@ CUDA 12.9, sm_121) — `tile_fft`/`tile_ifft` round-trip err 2.38e-07; `hasattr(
 `handheld_super_resolution/params.py`. **§6 PDFs extracted via `pdftotext` and read
 directly** (Baker–Kanade TPAMI, Park SPM, Takeda TIP) — the §6 equations/quotes are from
 those dumps, not from search summaries.
+
+## §6.7 Adversarial verdict (EXECUTED): can they / will they?
+
+The §6 directions were stress-tested adversarially with online research + executed
+probes (see eval/NOTES.md "Adversarial pass on the 3 continuous HF-recovery
+directions"). Verdicts: continuous per-pixel flow = NO (ill-posed tail, net-negative;
+use robustness rejection); adaptive-bandwidth/N=1 KR = NO (bias-variance dial, ~noise;
+N=1->N=0 after regularization, Takeda); frequency-domain de-aliasing = NO on real
+(ideal ~50dB but pixel-aperture null + <4% real aliasing + registration/local-motion
+mismatch; keep only the freq-domain registration CHECK). Downgrade §6.1/6.2/6.3 from
+"prototype it" to "bounded/abandoned -- confirmed by execution". Real levers:
+deconvolution (edges) + robustness rejection (the unalignable tail).
