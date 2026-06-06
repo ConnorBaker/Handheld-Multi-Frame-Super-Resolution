@@ -5,6 +5,8 @@ details live in nested files — read the one for the area you're touching:
 
 - `handheld_super_resolution/CLAUDE.md` — source layout, module index, pipeline.
 - `test/CLAUDE.md` — testing practices, properties, organization.
+- `eval/CLAUDE.md` — trusting a measurement: distribution / reliability / region /
+  viz discipline and symmetric self-skepticism (specializes §1).
 - `ADVERSARIAL_REVIEW.md` — code-simplification findings (what / why).
 - `REFACTORING_PLAN.md` — planned, ordered refactors (how / when).
 - `eval/NOTES.md` — offline-evaluation findings.
@@ -32,6 +34,11 @@ was *executable and self-checking* (tests that run).
   (Warp `@wp.kernel`s can't be defined via `exec()` / heredoc — use a real file.)
 - **Subagent results are inputs to verify, not conclusions.** Read what they wrote,
   re-run what they claim passed, re-derive their numbers.
+- **Running a measurement is necessary, not sufficient.** A number you computed
+  yourself can still mislead: verify a finding's *generality and stability* (the
+  distribution across many samples, not one), and apply *symmetric skepticism* —
+  red-team your OWN favorable claims at least as hard as a reference's. For
+  empirical / quality work this is its own discipline: `eval/CLAUDE.md`.
 
 **Keep these docs durable.** No line numbers, no test / case counts, no exact
 version pins in any CLAUDE.md — they rot. Put point-in-time specifics in the
