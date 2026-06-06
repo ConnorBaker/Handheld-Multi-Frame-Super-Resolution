@@ -85,13 +85,14 @@ def render_heatmap(sm, ref_path, out, width=1600):
     cv2.imwrite(out, cv2.addWeighted(base, 0.35, over, 0.65, 0))
 
 
-def render_montage(stack, merge_luma, cy, cx, size, out, tag, frames=(0, 20, 40)):
+def render_montage(stack, merge_luma, cy, cx, size, out, tag, frames=None):
     """3 independent DxO single renders + their HF (top), consensus(real) | our
     merge | inconsistency(hallucination) map (bottom)."""
     rois, info = H.extract_aligned_roi(stack, cy, cx, size=size, search=130)
     d = H.consensus_decomp(rois, info)
     cons = d["consensus"]
-    fa, fb, fc = (f for f in frames) if len(frames) == 3 else (0, len(rois) // 2, len(rois) - 1)
+    N = len(rois)
+    fa, fb, fc = frames if frames else (0, N // 2, N - 1)   # spread across the burst, N-aware
 
     def hp_vis(a, k=6):
         hp = H._highpass(a, 1.6)
@@ -140,9 +141,10 @@ def compute_merge_luma(burst_dir):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--burst", required=True, help="dir of DxO *_DxO-reference.dng renders")
+    ap.add_argument("--burst", required=True, help="dir of DxO linear-DNG renders")
     ap.add_argument("--out", default="eval/halluc_out", help="output dir")
-    ap.add_argument("--pattern", default="DSC*_DxO-reference.dng")
+    ap.add_argument("--pattern", default="DSC*_DxO-reference.dng", help="DNG glob (e.g. 'DSC*_DxO.dng')")
+    ap.add_argument("--arw", default=None, help="dir of .ARW frames for --merge auto (default: --burst)")
     ap.add_argument("--merge", default=None, help="'auto' (run pipeline on .ARW) or a linear-RGB .npy")
     ap.add_argument("--quick", action="store_true", help="coarser scene map (faster)")
     args = ap.parse_args()
@@ -161,12 +163,22 @@ def main():
     print(f"[drift] pan span {np.hypot(np.ptp(dys), np.ptp(dxs)):.0f}px  max rotation {th:.2f}deg  "
           f"max corner spread {spr:.0f}px (large spread + ~0 rotation => PARALLAX => per-ROI registration)")
 
-    # 2. scene-wide real-vs-hallucinated map
+    # 2. scene-wide real-vs-hallucinated map (cached: re-runs are expensive)
     stride = 384 if args.quick else 256
-    sm = H.scene_map(stack, stride=stride,
-                     progress=lambda i, n: print(f"  scene map row {i}/{n}", flush=True))
-    np.savez(os.path.join(args.out, "scene_map.npz"),
-             **{k: v for k, v in sm.items() if isinstance(v, np.ndarray)})
+    map_cache = os.path.join(args.out, "scene_map.npz")
+    if os.path.exists(map_cache):
+        z = np.load(map_cache)
+        sm = {k: z[k] for k in z.files}
+        for k in ("size", "n_tiles"):
+            sm[k] = int(sm[k])
+        for k in ("global_real_fraction", "weighted_real_fraction"):
+            sm[k] = float(sm[k])
+        print(f"[scene] reused {map_cache} (delete it to recompute)")
+    else:
+        sm = H.scene_map(stack, stride=stride,
+                         progress=lambda i, n: print(f"  scene map row {i}/{n}", flush=True))
+        np.savez(map_cache, **{k: (v if isinstance(v, np.ndarray) else np.array(v))
+                               for k, v in sm.items()})
     render_overview(paths[0], os.path.join(args.out, "overview_grid.png"))
     render_heatmap(sm, paths[0], os.path.join(args.out, "realfraction_heatmap.png"))
     print(f"[scene] GLOBAL real_fraction (HF-power-weighted, {sm['n_tiles']} tiles) = "
@@ -175,9 +187,10 @@ def main():
 
     # 3. controls / structure on auto-selected detail + flat tiles
     single = sm["grid_single"]; peakok = sm["grid_peak"] > 0.5
-    sflat = np.where(peakok, single, np.inf)
-    iy_d, ix_d = np.unravel_index(np.argmax(np.where(peakok, single, -1)), single.shape)
-    iy_f, ix_f = np.unravel_index(np.argmin(sflat), single.shape)
+    hf = np.where(peakok, single, np.nan)
+    iy_d, ix_d = np.unravel_index(np.nanargmax(hf), hf.shape)
+    target = np.nanquantile(hf, 0.15)                         # representative low-detail (not dead-flat) tile
+    iy_f, ix_f = np.unravel_index(np.nanargmin(np.abs(hf - target)), hf.shape)
     det_yx = (int(sm["ys"][iy_d]), int(sm["xs"][ix_d]))
     flat_yx = (int(sm["ys"][iy_f]), int(sm["xs"][ix_f]))
     base = H.extract_aligned_roi(stack, *det_yx, size=256, search=130)[0][0]
@@ -186,15 +199,17 @@ def main():
     for tag, yx in [("detail " + str(det_yx), det_yx), ("flat " + str(flat_yx), flat_yx)]:
         rois = H.extract_aligned_roi(stack, *yx, size=256, search=130)[0]
         s = H.inconsistency_structure(rois)
-        kind = "white NOISE" if s["lag1_autocorr"] < 0.15 else "structured INVENTED texture"
-        print(f"[structure] {tag}: lag-1 autocorr {s['lag1_autocorr']:.2f} -> {kind} "
-              f"(peak scale ~{s['peak_scale_px']:.1f}px)")
+        ac = s["lag1_autocorr"]
+        kind = ("negligible HF (too flat to characterize)" if not np.isfinite(ac)
+                else "white NOISE (residual)" if ac < 0.15 else "structured INVENTED texture")
+        print(f"[structure] {tag}: lag-1 autocorr {ac:.2f} -> {kind} (peak scale ~{s['peak_scale_px']:.1f}px)")
 
     # 4. merge cross-check (optional)
     merge_luma = None
     if args.merge == "auto":
-        print("[merge] running our pipeline on the .ARW burst ...")
-        merge_luma = compute_merge_luma(args.burst)
+        arw_dir = args.arw or args.burst
+        print(f"[merge] running our pipeline on the .ARW burst in {arw_dir} ...")
+        merge_luma = compute_merge_luma(arw_dir)
         np.save(os.path.join(args.out, "merge_linear_luma.npy"), merge_luma)
     elif args.merge:
         lin = np.load(args.merge)

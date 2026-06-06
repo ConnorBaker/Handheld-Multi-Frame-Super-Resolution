@@ -299,6 +299,9 @@ def inconsistency_structure(rois, hp_sigma=1.6):
     low/high radial-spectrum band ratio, and the spectral peak scale (px)."""
     hp = np.stack([_highpass(f, hp_sigma) for f in rois])
     dev = hp - hp.mean(0)                                      # per-frame inconsistency
+    if float(np.sqrt((dev ** 2).mean())) < 1e-6:              # dead-flat ROI: no HF to characterize
+        return dict(lag1_autocorr=float("nan"), low_hi_band_ratio=float("nan"),
+                    peak_scale_px=float("nan"), negligible=True)
     ac1 = float(np.mean([np.corrcoef(dev[i][:, :-1].ravel(), dev[i][:, 1:].ravel())[0, 1]
                          for i in range(len(dev))]))
     sz = dev.shape[1]
@@ -313,6 +316,7 @@ def inconsistency_structure(rois, hp_sigma=1.6):
         lag1_autocorr=ac1,
         low_hi_band_ratio=float(radial[:third].mean() / (radial[third:].mean() + 1e-9)),
         peak_scale_px=float(sz / (pk * 2)) if pk > 0 else float("inf"),
+        negligible=False,
     )
 
 
@@ -391,14 +395,16 @@ def find_step_edges(img, sz=140, bw=60, stride=80, margin=400, min_stepness=6.0,
 
 
 def compare_edge_sharpness(stack, merge_luma, edges, size=160, band=60,
-                           frames=(0, 8, 16, 24, 32, 40), search=140,
-                           rms_max=0.04, std_max=0.15):
+                           frames=None, search=140, rms_max=0.04, std_max=0.15):
     """Edge sigma (PSF width, px; smaller = sharper REAL resolution) for
     DxO-single / DxO-consensus / our-merge on each step edge, gated by ESF fit
     reliability (low erf residual + low per-frame variance). Returns a dict with
     per-edge rows and a `conclusion`; if no edge passes the gate the verdict is
     'inconclusive' (do not invent a sharpness claim)."""
     from .psf import esf_sigma
+    N = stack.shape[0]
+    if frames is None:                               # ~6 single frames spread across the burst
+        frames = list(range(0, N, max(1, N // 6)))
     rows, reliable = [], []
     for cy, cx, *_ in edges:
         rois, info = extract_aligned_roi(stack, cy, cx, size=size, search=search)

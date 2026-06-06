@@ -168,5 +168,6 @@ test_burst/
 results/
 
 # eval: hallucination analysis cache + regenerable outputs (multi-GB luma stack,
-# merge, montages/heatmap). Regenerate with: python -m eval._halluc_run
-eval/halluc_out/
+# merge, montages/heatmap, scene_map.npz). Regenerate with: python -m eval._halluc_run
+# (covers per-scene out dirs: halluc_out, halluc_out_007, ...)
+eval/halluc_out*/

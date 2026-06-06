@@ -330,3 +330,45 @@ power splits orthogonally into consistent (REAL) + per-frame (invented + noise);
 **Reproduce:** `python -m eval._halluc_run --burst <dxo_dng_dir> --out eval/halluc_out
 [--merge auto|merge.npy]`. Cache + montages/heatmap land in `eval/halluc_out/`
 (gitignored, multi-GB).
+
+### Second scene — building facade (a6300, 28 frames; ARW + DxO DNG)
+
+A burst with abundant straight edges (`Pictures/{ARW,DNG}/2025-09-06/007`,
+`DSC*_DxO.dng`) — the case the park scene lacked — so the edge-width (ESF/PSF)
+cross-check actually runs. Rigid man-made structure ⇒ **no wind confound** (the
+park's caveat is gone). Run:
+`python -m eval._halluc_run --burst <DNG dir> --pattern 'DSC*_DxO.dng' --arw <ARW dir> --merge auto --out eval/halluc_out_007`.
+
+**Real vs hallucinated:** GLOBAL real_fraction **0.72** (28% per-frame). Resampling
+floor 0.995 (genuine). The high-detail tiles are the building's horizontal louvers
+**at the sampling limit**: each single DxO frame *aliases* them differently
+(structured per-frame texture, lag-1 autocorr **0.75**) — a textbook single-frame
+reconstruction ambiguity that our multi-frame merge resolves from the combined
+sub-pixel samples. So the same story as the park, on rigid structure: edges/shape
+consistent (real), finest texture substantially per-frame (invented).
+
+**PSF / edge sigma (the new result — verified, and it corrects the park):** on the
+3 gate-passing clean step edges,
+- DxO single ≈ DxO consensus (1.61≈1.55, 2.19≈2.15, 1.88≈1.87) ⇒ DxO's edge WIDTH
+  is cross-frame consistent = **real**, not per-frame.
+- **DxO consensus edge sigma ≈ 1.87 px (median) vs our raw merge ≈ 2.14 px** ⇒ DxO
+  resolves sharper REAL edges by ~0.25 px. Verified NOT an artifact: merge sigma is
+  identical with/without the align-resample (2.14 both ways), and DxO's overshoot is
+  low (0.05) so it is not winning by haloing.
+- **Our shipped Polyblur deblur cannot close it**: inert at the shipped sigma_b=0.45
+  (2.14→2.13), and even maxed out (sigma_b=0) only reaches 2.07. Polyblur is a
+  conservative Gaussian-inverse tuned for ~1px softness; with c=0.352 and the
+  facade's high max-gradient it under-deconvolves. DxO's lens-measured deconvolution
+  is genuinely stronger on edges.
+
+**Net, honest reconciliation:** the park-scene impression that "our merge is sharper
+than DxO" was **never substantiated** (no clean edges there; the old σ1.58<1.97 claim
+was dropped). On a scene with *measurable* edges, **DxO wins real edge resolution**
+(its deconvolution), while **we win texture honesty** (the merge keeps only the
+cross-frame-consistent ~72%; DxO's extra fine texture is ~28% per-frame invention) —
+and noise. Closing the edge gap needs a PSF-informed deconvolution (we now have the
+measurement: merge edge sigma ≈ 2.1 px), not the current blind sigma_b.
+
+**Tooling:** the driver gained `--arw` (ARW and DNG in separate dirs), N-frame-aware
+montage/edge frame selection (28≠41 frames), a scene_map.npz cache, and a dead-flat
+ROI guard in `inconsistency_structure`.

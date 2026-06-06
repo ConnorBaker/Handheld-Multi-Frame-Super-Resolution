@@ -15,7 +15,7 @@ from scipy.ndimage import shift as ndshift
 
 from eval.hallucination import (
     pcc_shift, consensus_decomp, resampling_floor, inconsistency_structure,
-    extract_aligned_roi,
+    extract_aligned_roi, find_step_edges, compare_edge_sharpness,
 )
 
 
@@ -83,6 +83,41 @@ def test_inconsistency_separates_noise_from_texture():
     assert ac_white < 0.15, f"white noise autocorr {ac_white:.2f} should be ~0"
     assert ac_struct > 0.25, f"structured texture autocorr {ac_struct:.2f} should be >0"
     assert ac_struct > ac_white + 0.2
+
+
+def _slanted_edge(H, W, x0, blur, rng, noise=0.003, slope=0.06, lo=0.1, contrast=0.4):
+    yy, xx = np.mgrid[0:H, 0:W]
+    edge = (lo + contrast * (xx > x0 + slope * (yy - H / 2)).astype(np.float64))
+    return gaussian_filter(edge, blur).astype(np.float32) + rng.normal(0, noise, (H, W)).astype(np.float32)
+
+
+def test_find_step_edges_finds_a_clean_step():
+    """A clean vertical step is located; a flat image yields nothing."""
+    rng = np.random.default_rng(6)
+    img = _slanted_edge(500, 500, 250, 1.0, rng, noise=0.002)
+    edges = find_step_edges(img, margin=120, stride=60, min_sep=100)
+    assert edges, "should find the vertical step"
+    cy, cx, sc, con = edges[0]
+    assert abs(cx - 250) < 40 and con > 0.2
+    assert not find_step_edges(gaussian_filter(np.full((500, 500), 0.3, np.float32), 1.0),
+                               margin=120, stride=60)
+
+
+def test_compare_edge_sharpness_recovers_blur_and_is_N_aware():
+    """End-to-end ESF on a small (N=12) stack: recovers the injected consensus
+    blur, sees the sharper 'merge', and -- the regression guard -- does NOT assume
+    >=40 frames (the bug that indexed frame 40 of a 28-frame burst)."""
+    rng = np.random.default_rng(7)
+    base = _slanted_edge(400, 400, 200, 1.2, rng)
+    sharp = _slanted_edge(400, 400, 200, 0.8, rng, noise=0.0)         # a sharper 'merge'
+    stack = np.stack([base] + [ndshift(_slanted_edge(400, 400, 200, 1.2, rng),
+                                       rng.uniform(-0.5, 0.5, 2), order=3, mode="reflect")
+                               for _ in range(11)]).astype(np.float32)
+    res = compare_edge_sharpness(stack, sharp, [(200, 200, 20.0, 0.4)], size=120, band=50, search=60)
+    assert res["n_reliable"] >= 1, res["conclusion"]
+    row = res["rows"][0]
+    assert 0.9 < row["consensus"] < 1.6, f"consensus sigma {row['consensus']} should be ~1.2"
+    assert row["merge"] < row["consensus"], "the sharper merge must measure a smaller sigma"
 
 
 def test_extract_aligned_roi_registers_known_shifts():
