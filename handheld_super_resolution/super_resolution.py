@@ -150,7 +150,9 @@ def main(ref_img, comp_imgs, config):
                         cuda_im_grey, config)
         
         if debug_mode:
-            debug_dict["flow"].append(cuda_final_alignment.copy_to_host())
+            # cuda_final_alignment is a torch tensor (the alignment port returns
+            # torch, not a numba device array) -- copy_to_host() no longer exists.
+            debug_dict["flow"].append(cuda_final_alignment.detach().cpu().numpy())
             
         #### Robustness
         cuda_robustness = compute_robustness_(cuda_img, ref_local_means, ref_local_stds, cuda_final_alignment,
@@ -168,8 +170,9 @@ def main(ref_img, comp_imgs, config):
             cuda.synchronize()
             getTime(im_time, '\nImage processed (Total)')
             
-        if debug_mode : 
-            debug_dict['robustness'].append(cuda_robustness.copy_to_host())
+        if debug_mode :
+            # cuda_robustness is a cupy array (the robustness port is cupy, not numba).
+            debug_dict['robustness'].append(cp.asnumpy(cuda_robustness))
         stream.synchronize()
     
     #### Ref kernel estimation
