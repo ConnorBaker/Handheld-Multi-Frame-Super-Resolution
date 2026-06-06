@@ -662,3 +662,45 @@ opt-in); (2) tighter ROBUSTNESS REJECTION (robustness.t up) for the unalignable 
 (3) freq-domain registration CHECK as a diagnostic. The pipeline already extracts ~all
 the real HF the samples hold (matches ~77% real-fraction + optics ceiling); a genuine
 SR out-resolve needs sub-Nyquist chart content that natural AA'd scenes lack.
+
+### Deconv+rejection validation; registration; wavelet/continuous research
+
+DECONV (validated vs DxO consensus, 007, matched + reliability-gated): measured-PSF
+GATED deconv (auto-sigma 1.95, target_frac~0.65) reaches edge sigma 1.70 == DxO 1.71
+from REAL detail, at LOWER overshoot (0.011 vs DxO 0.019) and flat-noise 0.0012
+(below the raw merge 0.0018; DxO 0.0005 is cleaner -- DeepPRIME denoises flats
+harder, but ours is not hallucinated). => we MATCH DxO edge sharpness honestly. The
+edge lever WORKS. Stays opt-in (postprocessing.aberration.deblur_method=measured_rl)
+until cross-scene-validated before defaulting. (eval/_validate_deconv_rejection.py)
+
+REJECTION (robustness.t 0.12 vs 0.30): INERT on BOTH the 007 facade (rigid) and the
+park (clean/static) -- edge sigma, texture HF, flat noise all bit-identical. WHY
+(mechanistic): on WELL-ALIGNED content every frame has ~equal robustness R, so the t
+shift (R = S*exp(-d^2/s^2) - t) cancels in the merge num/den normalization. t only
+bites when frames DIFFER in alignment (mix of aligned + misaligned: wind foliage,
+moving objects, large parallax) -- which neither burst has. The fidelity sweep that
+found t 0.12->0.31 helps used a more-misaligned scene. Real but SCENE-DEPENDENT lever,
+untestable on these two bursts.
+
+REGISTRATION (eval/research_registration.md): (1) grey alignment correct (max-SNR,
+Wronski/HDR+; FFT keeps sub-pixel cues). (2) per-channel: don't -- R/B Bayer-sparse +
+noisy -> 3 shaky flows; fix lateral CA with a calibrated radial R/B->G warp or the
+learned defringe, not alignment. (3) TWO-GREEN IDEA: ALREADY CAPTURED -- verified the
+merge consumes the RAW mosaic per-channel (warp_ops.py:106 channel=cfa[ii&1,jj&1];
+main feeds raw, grey is alignment-only), both greens -> ch1 at their own (1,1)-offset
+positions (quincunx, 2x green density, ~4-5 green samples/output px). Greens averaged
+ONLY in the alignment grey + robustness guide (correct SNR choice there). Not a
+missing lever. Optional cheap insurance: per-burst Gr/Gb (green-green) imbalance match.
+
+WAVELET/CONTINUOUS (eval/research_wavelets_continuous.md): the user's two refs are
+LEARNED. ContinuousSR ("Pixel to Gaussian", 2D Gaussian splatting): its render eq is
+VERBATIM our steering-kernel-regression merge (our merge IS a re-queryable continuous
+Gaussian field -> free fractional scale); params learned -> hallucinates. WaveHiT-SR
+(arXiv:2508.19927): DWT is an internal efficiency trick, nothing usable. ONE genuinely
+transferable deterministic win: ForWaRD / Wavelet-Vaguelette deconvolution (Neelamani
+2004 / Donoho) -- less ringing than Wiener, edge-preserving; principled replacement
+for the ad-hoc RL+bilateral in deblur_gated (candidate, UNVERIFIED on our data).
+Everything else (LIIF/LTE/CiaoSR/GaussianSR, wavelet-diffusion, DWSR) is learned and
+hallucinates HF. Meta: the continuous-field REFRAMING is illuminating (our merge =
+SOTA's representation) but every recent NUMERIC win is a learned prior inventing HF,
+not new information -- nothing beats the optics ceiling deterministically.
