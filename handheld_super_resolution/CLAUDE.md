@@ -36,6 +36,11 @@ denoisers in `utils_image.py`. Don't reintroduce compute kernels in numba.
 - `robustness.py` — per-pixel robustness mask (guide image, local stats, noise
   model, flow-discontinuity penalty).
 - `merge.py` — Alg. 4 / 11 accumulation; delegates to the Warp merge.
+- `streaming.py` — incremental, arbitrary-scale wrapper over the same primitives:
+  scale-free build (align / robustness / kernels per frame, stored) + scale-dependent
+  `render(scale)` (replay the Warp gathers + divide). The merge's additivity makes
+  streaming == batch and enables a persistable arbitrary-scale artifact. Behaviour-
+  preserving over `main`'s merge — asserted bit-exact in `test/test_streaming.py`.
 - `cupy_ops.py` — CuPy/torch ports of the numba kernels (the live compute layer);
   re-exports the merge from `warp_ops`.
 - `warp_ops.py` — the merge accumulation as NVIDIA Warp kernels (a per-thread

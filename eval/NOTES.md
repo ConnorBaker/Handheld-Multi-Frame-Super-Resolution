@@ -866,3 +866,32 @@ CONVERGENCE: the jut / multi-frame edge-fidelity cost is the steerable-kernel re
 + residual optical MTF, NOT flow error and NOT a tile seam. Deconvolution is the edge
 lever and our gated-RL already IS the deterministic optimum (= the multi-frame-deconv
 limit at scale=1). Three rearchitectures ruled out by executable evidence, not guessing.
+
+### StreamingMerge: incremental + arbitrary-scale merge (BUILT, bit-exact over main)
+
+Implemented handheld_super_resolution/streaming.py + test/test_streaming.py (the
+research_persist_incremental.md plan, now code). Separates main()'s monolithic
+per-frame-analyse-then-accumulate into:
+  - BUILD (scale-free): add_frame(comp) -> align + robustness + estimate_kernels,
+    stored per frame; ref kernels + local stats at init. O(1) in existing frames.
+  - RENDER(scale): alloc num/den at scale, replay the Warp gathers for every stored
+    frame + the reference, divide. Any scale (incl. fractional) from ONE build.
+Verified (test_streaming.py + on the real 007 burst): render(scale) == main() at that
+scale BIT-EXACT (max|diff| 0 on finite pixels; border NaN masks match); streaming
+A-then-B == batch [A,B] bit-exact (additive merge); arbitrary-scale render(1/1.5/2);
+save/load round-trip bit-exact. Refuses the accumulated-robustness denoiser (its
+overwrite branch breaks additivity). No change to main()/merge/warp_ops -- new module.
+CAVEAT: the persisted artifact is large at full res (~270 MB/frame: stores comp raw +
+covs + robustness + flow). Lean mode (store only {raw, flow}, recompute covs+robustness
+at render -- both are scale-free, no re-alignment) would cut it ~5x; not yet built.
+
+### "More frames doesn't sharpen" -- adversarially confirmed at scale=2 (not a scale=1 artifact)
+
+eval/_frame_scaling.py, 007, scale=2, N=2..28: matched physical edge sigma vs DxO is
+FLAT in N (2.01-2.08, spread 0.16 = N=2 small-sample noise) -> edges are OPTICS-limited,
+fusion cannot sharpen them at ANY scale (refutes the worry that the deconv-merge agent's
+"cleaner not sharper" was a scale=1 artifact). Texture SR-band power FALLS with N
+(5.6->2.0) and flat-region SR-band falls then plateaus (noise) -> more frames de-alias +
+denoise (saturating), they do not ADD resolved detail. The sharpness ceiling is hit
+early; only deconvolution (up to the noise floor) touches the optical MTF. (The de-alias
+vs over-smooth split of that texture-SR-band drop is being measured separately.)
