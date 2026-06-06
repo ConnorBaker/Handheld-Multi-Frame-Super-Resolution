@@ -223,6 +223,9 @@ def _deblur(img, deblur_config):
 
     t = torch.as_tensor(np.ascontiguousarray(img), dtype=torch.float32, device="cuda")
     t = t.permute(2, 0, 1).unsqueeze(0).clamp(0.0, 1.0)  # (1, 3, H, W)
+    # prefiltering is SNR-resolved (params.py) to a bool; if it arrives unresolved
+    # (e.g. a raw config), default to the noise-safe True.
+    pf = deblur_config.get("prefiltering", True)
     out = polyblur_deblurring(
         t,
         n_iter=int(deblur_config.get("n_iter", 1)),
@@ -231,7 +234,7 @@ def _deblur(img, deblur_config):
         alpha=float(deblur_config.get("alpha", 2)),
         beta=float(deblur_config.get("beta", 3)),
         remove_halo=bool(deblur_config.get("remove_halo", True)),
-        prefiltering=bool(deblur_config.get("prefiltering", True)),
+        prefiltering=True if pf == "SNR_based" else bool(pf),
         edgetaping=bool(deblur_config.get("edgetaping", True)),
     )
     return out.squeeze(0).permute(1, 2, 0).contiguous().cpu().numpy()

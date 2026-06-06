@@ -89,6 +89,17 @@ def update_snr_config(config, SNR):
     else:
         assert isinstance(config.merging.tuning.D_tr, float), "D_tr should be a float or 'SNR_based'"
 
+    # Deblur prefiltering is a NOISE-safety knob: it splits the image into a smooth
+    # base + a detail/noise residual and deconvolves ONLY the base, so on a noisy
+    # burst it stops the deblur amplifying noise -- but it also nearly nulls the
+    # sharpening (the fine detail it spares is most of what you perceive). So resolve
+    # it from SNR: ON when noisy, OFF once the (merged) burst is clean enough to
+    # deblur aggressively, e.g. low-ISO multi-frame merges. (Threshold 27 on the
+    # 6..30-clipped SNR sits between a noisy burst ~24 and a clean one at the 30 cap.)
+    deblur = config.get("postprocessing", {}).get("deblur", None)
+    if deblur is not None and deblur.get("prefiltering") == "SNR_based":
+        deblur.prefiltering = bool(SNR < 27.0)
+
 
 def lerp(x, x_range, y_range):
     """

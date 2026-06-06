@@ -53,11 +53,18 @@ postprocessing:
     enabled: true
     n_iter: 1
     c: 0.352             # blur-model slope   (sigma^2 = c^2/grad^2 - sigma_b^2, clamped)
-    sigma_b: 0.768       # blur-model intercept (higher => less blur estimated => weaker deblur)
-    alpha: 3              # mid-frequency deconvolution strength (tuned: synthetic-GT + Canon)
-    beta: 3               # high-frequency deconvolution strength (tuned)
+    sigma_b: 0.45        # blur-model intercept. Polyblur's 0.768 default estimated ~0 blur on our
+                         #   (already fairly sharp) merge -> inert; ~0.45 makes it engage (confirmed
+                         #   by the DxO per-burst sweep, db_sigma_b=0.448, AND by hand). M scales
+                         #   with image size, so this is CONTENT/SCALE-DEPENDENT -- calibrate per
+                         #   camera/scale (eval.sweep_synthetic --dxo-ref) for best results.
+    alpha: 3              # mid-frequency deconvolution strength
+    beta: 3              # high-frequency deconvolution strength
     remove_halo: true     # suppress deblur halos at strong edges
-    prefiltering: true    # base/detail split to limit noise amplification
+    prefiltering: SNR_based  # noise-safety base/detail split: ON when noisy (else the deblur
+                         #   amplifies noise -> PSNR drops), OFF once clean enough to deblur
+                         #   aggressively. Nearly nulls the deblur when ON, so it MUST be off for
+                         #   clean low-ISO merges to sharpen. Resolved from SNR in params.py.
     edgetaping: true
   aberration:             # Stage B: per-tile (spatially-varying) deblur + learned defringe (vendored); DEFAULT
     enabled: true         # the default sharpening path; takes precedence over deblur/sharpening

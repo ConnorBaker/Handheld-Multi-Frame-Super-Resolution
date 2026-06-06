@@ -109,6 +109,19 @@ def test_pipeline_robustness_off_with_save_mask_does_not_crash():
     assert np.isfinite(out).all()
 
 
+def test_snr_resolves_deblur_prefiltering():
+    """`prefiltering: SNR_based` -> ON when noisy, OFF when clean.
+
+    Prefiltering only deconvolves the smooth base, so it nearly nulls the deblur;
+    it must be OFF on clean low-ISO merges (so the deblur actually engages) and ON
+    when noisy (so the deblur doesn't amplify noise -> PSNR drop). See params.py.
+    """
+    clean = OmegaConf.load(DEFAULT_CONFIG); update_snr_config(clean, 30.0)
+    noisy = OmegaConf.load(DEFAULT_CONFIG); update_snr_config(noisy, 10.0)
+    assert clean.postprocessing.deblur.prefiltering is False
+    assert noisy.postprocessing.deblur.prefiltering is True
+
+
 def test_pipeline_super_resolution_x2():
     ref = _scene()
     comps = np.stack([_shift(ref, 0.7, -0.4), _shift(ref, -1.3, 0.8), _shift(ref, 0.2, 1.1)])
