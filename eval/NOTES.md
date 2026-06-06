@@ -794,3 +794,26 @@ x-flow aperture-problem noise on horizontal louver edges (x-flow noisy -1..-10px
 between adjacent tiles while y-flow is smooth ~-2px; flow has ~2% block-match
 outliers, mostly OOB-skipped by the merge). The optical edge skirt (research_bloom_
 banding.md: per-frame PSF, in DxO too, display-gain illusion under shadow-lift).
+
+### The user's "sharp edge jutting right from the blind" (localized, NOT a tile seam)
+
+User pointed at a specific feature just below a tile line in seam_adjudicate (scale-1
+crop cy=960,cx=1840; feature at crop y~113, x~77 = abs ~y993,x1837). "Looks like bad
+tile fusion." Investigated with the DxO-no-tiles control + single-vs-multi attribution
+(eval/_jut_investigate.py, _jut_attribute.py):
+- It is a REAL feature: one DxO frame diverges only 0.016 (rms 0.003) from the DxO
+  cross-frame consensus -- the real-content/noise floor. The dark marks appear in DxO.
+- It is NOT a tile-grid seam: the divergence peaks MID-tile (x=77; borders at 64/80),
+  not at a border; and it is in the raw merge (deconv slightly REDUCES it, 0.074->0.066).
+- The multi-frame FUSION adds it: vs the DxO consensus, max|div| single-frame merge
+  0.044 (rms 0.005) -> multi-frame 0.074 (rms 0.011). The comp-frame alignment roughly
+  DOUBLES the single-frame (steerable-kernel) divergence at this edge. So the user's
+  "fusion" intuition is right (just not "tiles").
+- Direction tested and NOT supported: |div|-energy x/y spread is ~1.2 for BOTH single
+  (1.24) and multi (1.16) -- the fusion does NOT add a specifically horizontal smear,
+  so it is NOT attributable to the aperture problem. It is a broad, ~isotropic
+  alignment-fidelity cost in this edge region, not a directional streak.
+Open: whether better flow regularization / rejection reduces the multi-frame component
+(aperture + edge-skirt research in flight). Divergence-from-DxO is vs a REFERENCE, not
+ground truth -- ours could differ without being "wrong"; the addressable part is the
+fusion adding ~2x over single-frame.
