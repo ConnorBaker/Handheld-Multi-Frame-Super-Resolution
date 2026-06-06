@@ -728,3 +728,28 @@ t is a uniform offset on an already-per-pixel field.
 - Literature: Wronski/IPOL (t a global scalar); Lafenetre satellite adds a per-pixel
   SNR weight h_n (k=w*r*h), NOT a spatial t, and h_n helps only multi-EXPOSURE bursts.
 (eval/research_robustness_perpixel.md, eval/_probe_robustness_perpixel.py)
+
+### Persist arbitrary-scale artifact + incrementalize: BOTH feasible, no merge-math change
+
+User: can we save an artifact for arbitrary-scale re-render + incrementalize? YES
+(subagent execution-verified on GB10; structurally confirmed here):
+- config.scale enters ONLY (a) the num/den output-grid alloc and (b) the merge
+  kernel HR->LR coord map (warp_ops.py: lr=(j+0.5)/scale). Flow, covariance Omega,
+  robustness, ref stats are LR/grey-coord, scale-INVARIANT (verified bit-exact,
+  max|diff|=0 across scales 1/2/3). estimate_cov/kernels take no scale.
+- The merge ACCUMULATES (num[i,j]+=w*r*c, den+=w*r per frame -- warp_ops.py:129-135)
+  -> exactly additive -> streaming A-then-B == merge([A,B]) (bit-exact); removal = -=
+  (float32-exact). Incremental fusion is natural.
+- ARBITRARY-SCALE ARTIFACT = persist the REPRESENTATION, not the render: per comp
+  frame {raw, flow, Omega, robustness} + ref {raw, Omega} + SNR-config (~4.5 MiB/frame
+  @512x768; few hundred MB full-res). A new scale re-runs ONLY the 2 Warp gathers +
+  divide (fractional scale works today). Do NOT persist num/den (scale-specific; a
+  coarse grid is not a downsample of a fine one).
+- INCREMENTAL: add frame = compute its 3 ref-relative fields + merge (O(1) in existing
+  frames); render = divide(num,den) anytime. Caveats: fixed reference (changing it =
+  full recompute); the accumulated-robustness denoiser (default OFF) takes an overwrite
+  branch that breaks ref-additivity if ON; keep divide out of running state.
+- Verdict: a control-flow refactor (a StreamingMerge API), NO merge-math change.
+Literature: GSASR (representation + scale-aware-render split), LIIF/A-LIIF, BurstM,
+Unser splines, Elad-Feuer recursive/Kalman SR, online MFSR.
+(eval/research_persist_incremental.md)
