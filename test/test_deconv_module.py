@@ -127,6 +127,28 @@ def test_edge_gate_accepts_numpy_and_clamps_negative_l1():
     assert float(g.min()) >= 0.0 and float(g.max()) <= 1.0
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for a >2**24 field")
+def test_edge_gate_large_frame_subsamples_quantile():
+    """A full-res frame (e.g. 24 MP) exceeds torch.quantile's 2**24-element limit,
+    which raised ``RuntimeError: quantile() input tensor is too large`` on the
+    shipped measured_rl path. The gate must instead estimate the lo/hi percentile
+    thresholds from a random subsample. Regression for that crash: a >2**24 field
+    must (a) not raise, (b) stay in [0,1] / NaN-free, and (c) match the result on a
+    just-under-limit field of the same statistics to within the smoothstep's
+    sensitivity (the subsampled quantile ~= the full one)."""
+    QMAX = 2 ** 24
+    g = torch.Generator(device="cuda").manual_seed(7)
+    big = (torch.rand(QMAX + 4096, generator=g, device="cuda") ** 2).reshape(4097, 4096)
+    out = edge_gate_from_l1(big)                                   # must not raise
+    assert out.shape == big.shape and torch.isfinite(out).all()
+    assert float(out.min()) >= 0.0 and float(out.max()) <= 1.0
+    # same distribution, just under the limit -> the subsampled thresholds should
+    # land the mean gate within a couple percent of the exact-quantile gate.
+    small = (torch.rand(4000 * 4000, generator=g, device="cuda") ** 2).reshape(4000, 4000)
+    assert small.numel() < QMAX
+    assert abs(float(out.mean()) - float(edge_gate_from_l1(small).mean())) < 0.02
+
+
 def test_gate_blend_leaves_flat_unchanged_narrows_edge():
     """The intended use -- out = img + gate*(deconv - img) -- narrows the edge while
     leaving the flat side essentially untouched (gate ~0 there)."""

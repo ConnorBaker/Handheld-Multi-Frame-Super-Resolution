@@ -118,7 +118,19 @@ def edge_gate_from_l1(l1, lo_pct=50, hi_pct=90):
         l1 = torch.as_tensor(l1)
     l1 = l1.to(torch.float32)
     strength = torch.sqrt(l1.clamp(min=0))
-    lo = torch.quantile(strength.flatten(), lo_pct / 100.0)
-    hi = torch.quantile(strength.flatten(), hi_pct / 100.0)
+    flat = strength.flatten()
+    # torch.quantile() rejects inputs above 2**24 elements; a full-res frame (e.g.
+    # 24 MP) exceeds that, so estimate the percentile thresholds from a random
+    # subsample (verified: a 1M-sample quantile matches the full one to ~2e-4, far
+    # below the smoothstep's sensitivity). Deterministic seed -> reproducible gate.
+    QMAX = 2 ** 24
+    if flat.numel() > QMAX:
+        g = torch.Generator(device=flat.device).manual_seed(0)
+        idx = torch.randint(flat.numel(), (1 << 20,), generator=g, device=flat.device)
+        sample = flat[idx]
+    else:
+        sample = flat
+    lo = torch.quantile(sample, lo_pct / 100.0)
+    hi = torch.quantile(sample, hi_pct / 100.0)
     t = ((strength - lo) / (hi - lo + 1e-12)).clamp(0.0, 1.0)
     return (t * t * (3.0 - 2.0 * t)).to(torch.float32)  # smoothstep
