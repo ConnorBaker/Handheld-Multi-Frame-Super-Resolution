@@ -171,3 +171,6 @@ results/
 # merge, montages/heatmap, scene_map.npz). Regenerate with: python -m eval._halluc_run
 # (covers per-scene out dirs: halluc_out, halluc_out_007, ...)
 eval/halluc_out*/
+
+# eval: deconv-in-merge feasibility cache (regenerable)
+eval/_deconv_merge_cache/

@@ -817,3 +817,52 @@ Open: whether better flow regularization / rejection reduces the multi-frame com
 (aperture + edge-skirt research in flight). Divergence-from-DxO is vs a REFERENCE, not
 ground truth -- ours could differ without being "wrong"; the addressable part is the
 fusion adding ~2x over single-frame.
+
+### Four parallel HF-lever investigations -- all verified, all converge: deconv is the lever, and we already have it
+
+User: "research all of these in parallel." Four subagent threads (worktree-isolated;
+each measure-before-build, red-team own result, executable evidence). All re-verified
+here by re-running their decisive checks. THREE "build something new" levers came back
+negative/marginal; the edge-fidelity gap is the optical MTF, already handled by the
+opt-in measured-PSF gated-RL.
+
+1. SPATIALLY-VARYING PSF (Lever A) -- NEGATIVE, corroborated on a corner-reaching scene.
+   A field-varying deconv must vary the GAP = merge_sigma - DxO_sigma. On 007 the gap is
+   FLAT vs field radius (slope CI straddles 0; corr(DxO,merge)=0.98 -> the sigma scatter
+   is subject DEPTH on the oblique facade, NOT lens field). Retested on the park burst
+   (DSC00034-74) which reaches r_norm~0.87 (007 only ~0.55-0.80): ESF gap FLAT (CI
+   [-0.85,+0.99], corr 0.91) AND a wind-free, round-trip-validated grass-relsharpness
+   probe (reaching the bottom corners) finds the merge if anything SHARPER than DxO
+   off-axis (slope -1.44) -- DxO over-denoises low-SNR/vignetted corner grass. No
+   merge->reference field-softness gap to close. eval/_psf_field_validate.py (007),
+   eval/_psf_field_park_validate.py (park). DO NOT build Lever A. (Side-finding: at
+   low-SNR corners our merge already beats DxO's over-denoising.)
+
+2. DECONV-INTO-MERGE (Levers B/C) -- NEGATIVE at scale=1, by an ALGEBRAIC identity.
+   At scale=1, static PSF, pre-aligned frames, multi-frame RL == RL(mean of frames):
+   the update h^T (*) (y_i/(h(*)x)) sums linearly through a SHARED denominator. Verified
+   N=1 and N=4 (max|diff| ~2e-6). That is exactly our merge->gated-RL. Frame-count
+   scaling confirms the static-PSF prediction: more frames -> CLEANER not sharper
+   (flat-noise ~1/sqrt(N), edge sigma constant). Only scale>1 (SR) differs, and even
+   there folding beats a strawman by +0.01-0.15 dB (our steerable-kernel merge already
+   fuses warps). eval/_deconv_merge_core.py (self-tests), _deconv_merge_validate.py.
+   NOT worth the rearchitecture. The multi-frame benefit is noise, already captured.
+
+3. FLOW REGULARIZATION (aperture) -- NEGATIVE for the jut; ~1% scene tidy-up only.
+   Census (verified): 85.5% of tiles WELL-CONDITIONED, 12.5% aperture-ambiguous (l1>tau,
+   l2<=tau, tau=noise-tied), 0% fail the |det| guard. KEY: the high-divergence jut tile
+   is WELL-CONDITIONED (l2~37*tau, coherence 0.27) -- the ambiguous 12.5% are the
+   low-contrast wall where flow error is perceptually irrelevant. So the visible edge
+   cost is at high-contrast 2-D structure where the flow is CORRECT -> no flow regularizer
+   can fix it (independently confirms the "jut is isotropic, not aperture" finding). The
+   recipe (Tikhonov damping + guided vector-median, both opt-in, default-off bit-identical,
+   suite green) is a WASH on edges (10-edge median: recipe 0.068 vs multi 0.073). One
+   genuine but small signal: the outlier-gated vector-median cleans the ~2% catastrophic
+   block-match failures for ~1% scene-wide rms-div reduction (ghost-safe, non-blinding to
+   compute_s; +7% ghosting on INJECTED motion). eval/_aperture_{census,validate,
+   robustness}.py; the (unmerged) opt-in code preserved in eval/aperture_flow_optin.patch.
+
+CONVERGENCE: the jut / multi-frame edge-fidelity cost is the steerable-kernel resampling
++ residual optical MTF, NOT flow error and NOT a tile seam. Deconvolution is the edge
+lever and our gated-RL already IS the deterministic optimum (= the multi-frame-deconv
+limit at scale=1). Three rearchitectures ruled out by executable evidence, not guessing.

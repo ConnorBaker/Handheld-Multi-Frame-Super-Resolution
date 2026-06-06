@@ -1,0 +1,230 @@
+diff --git a/handheld_super_resolution/ICA.py b/handheld_super_resolution/ICA.py
+index 0361573..11ce263 100644
+--- a/handheld_super_resolution/ICA.py
++++ b/handheld_super_resolution/ICA.py
+@@ -5,7 +5,7 @@ import torch.nn.functional as F
+ 
+ from .utils import DEFAULT_NUMPY_FLOAT_TYPE, DEFAULT_TORCH_FLOAT_TYPE
+ from .utils_image import compute_hessian_cupy
+-from .cupy_ops import ica_iterate_cupy, to_torch
++from .cupy_ops import ica_iterate_cupy, flow_vector_median_cupy, to_torch
+ FLOAT = DEFAULT_NUMPY_FLOAT_TYPE
+ SOBEL_Y = torch.as_tensor(np.array([[-1], [0], [1]]), dtype=DEFAULT_TORCH_FLOAT_TYPE, device="cuda")[None, None]
+ SOBEL_X = torch.as_tensor(np.array([[-1,0,1]]), dtype=DEFAULT_TORCH_FLOAT_TYPE, device="cuda")[None, None]
+@@ -28,10 +28,31 @@ def align_lvl_ica(ref_img, ref_gradx_lvl, ref_grady_lvl, ref_hessian_lvl,
+     tile_size = config.block_matching.tuning.tile_sizes[l]
+     n_iter = config.ica.tuning.n_iter
+ 
+-    # CuPy replacement for the numba ica_kernel_* (numba can't JIT here).
++    # Opt-in flow regularization (default OFF -> bit-identical to the original):
++    #   block_matching.tuning.flow_tikhonov_lambda : Levenberg/Tikhonov damping of
++    #       the per-tile Hessian inside the ICA solve (cannot ghost; all levels).
++    #   block_matching.tuning.flow_median : guided vector-median over the per-tile
++    #       flow grid AFTER ICA, applied conservatively (only where the flow
++    #       neighbourhood is locally consistent). Applied at the FINEST level only
++    #       (l == 0) -- that flow feeds both the merge and the robustness mask.
++    bm = config.block_matching.tuning
++    lam = float(bm.get("flow_tikhonov_lambda", 0.0) or 0.0)
++
+     new_flow = ica_iterate_cupy(
+         ref_img, ref_gradx_lvl, ref_grady_lvl, ref_hessian_lvl,
+-        moving_lvl, alignment, tile_size, n_iter)
++        moving_lvl, alignment, tile_size, n_iter, tikhonov_lambda=lam)
++
++    med = bm.get("flow_median", None)
++    if med and l == 0:
++        new_flow = flow_vector_median_cupy(
++            new_flow, guide=ref_img, tile_size=tile_size,
++            window=int(med.get("window", 3)),
++            consistency_span=(None if med.get("consistency_span", None) is None
++                              else float(med.get("consistency_span"))),
++            outlier_thresh=(None if med.get("outlier_thresh", None) is None
++                            else float(med.get("outlier_thresh"))),
++            guide_sigma=float(med.get("guide_sigma", 0.0) or 0.0))
++
+     # write the result back into the torch alignment tensor, in place
+     alignment.copy_(to_torch(new_flow))
+ 
+diff --git a/handheld_super_resolution/cupy_ops.py b/handheld_super_resolution/cupy_ops.py
+index 4600df6..bef6224 100644
+--- a/handheld_super_resolution/cupy_ops.py
++++ b/handheld_super_resolution/cupy_ops.py
+@@ -61,12 +61,24 @@ def gat_cupy(image, alpha, beta):
+ # ---------------------------------------------------------------------------
+ # ICA (Lucas-Kanade) optical-flow iteration  (replaces ica_kernel_8/16/32/64)
+ # ---------------------------------------------------------------------------
+-def ica_iterate_cupy(ref_img, gradx, grady, hessian, moving, alignment, tile_size, n_iter):
++def ica_iterate_cupy(ref_img, gradx, grady, hessian, moving, alignment, tile_size,
++                     n_iter, tikhonov_lambda=0.0):
+     """Vectorized inverse-compositional Lucas-Kanade.
+ 
+     Parameters mirror the numba ``ica_kernel_*`` kernels. ``alignment`` is
+     (n_patch_y, n_patch_x, 2) with [...,0]=x flow, [...,1]=y flow. Returns the
+     updated alignment as a cupy array (same shape).
++
++    ``tikhonov_lambda`` (default 0.0 -> bit-identical to the original) adds a
++    Levenberg/Tikhonov damping term ``lambda * I`` to the per-tile Hessian before
++    the solve: ``(H + lambda*I) dx = B``. This shrinks the ILL-CONDITIONED
++    (along-edge) update toward zero -- i.e. toward the block-match prior the ICA
++    refines -- on aperture-ambiguous tiles (one large eigenvalue, one ~0), while
++    leaving well-conditioned tiles (both eigenvalues >> lambda) essentially
++    unchanged. It uses NO neighbour information, so it CANNOT introduce ghosting
++    (Baker-Matthews "LK 20 Years On" list LM as a standard LK variant). With
++    lambda > 0 the damped Hessian is positive-definite, so the ``|det|>=1e-10``
++    guard is always satisfied (the original guard is preserved for lambda == 0).
+     """
+     ref = cp.asarray(ref_img, dtype=cp.float32)
+     gx = cp.asarray(gradx, dtype=cp.float32)
+@@ -84,10 +96,12 @@ def ica_iterate_cupy(ref_img, gradx, grady, hessian, moving, alignment, tile_siz
+     gx = gx[:H, :W]
+     gy = gy[:H, :W]
+ 
+-    A00 = A[..., 0, 0]
++    # Tikhonov/Levenberg damping on the diagonal (lambda == 0 -> original math).
++    lam = cp.float32(tikhonov_lambda)
++    A00 = A[..., 0, 0] + lam
+     A01 = A[..., 0, 1]
+     A10 = A[..., 1, 0]
+-    A11 = A[..., 1, 1]
++    A11 = A[..., 1, 1] + lam
+     det = A00 * A11 - A01 * A10
+     solvable = cp.abs(det) >= 1e-10
+     det_safe = cp.where(solvable, det, 1.0)
+@@ -119,6 +133,137 @@ def ica_iterate_cupy(ref_img, gradx, grady, hessian, moving, alignment, tile_siz
+     return flow
+ 
+ 
++def flow_vector_median_cupy(flow, guide=None, tile_size=None, window=3,
++                            consistency_span=None, outlier_thresh=None,
++                            guide_sigma=0.0):
++    """Conservative, guided (cross-bilateral) VECTOR-median of a per-tile flow grid.
++
++    Opt-in flow regularization applied AFTER ICA. ``flow`` is (ny, nx, 2). For each
++    tile we pick, among the candidate vectors in its ``window``x``window``
++    neighbourhood, the one minimizing the (optionally guide-weighted) sum of L2
++    distances to the others -- the weighted vector median (Astola-Haavisto-Neuvo,
++    Proc. IEEE 1990; Sun-Roth-Black CVPR 2010 found a *weighted* post-warp median
++    "the single most important secret", the weighting preventing over-smoothing
++    across boundaries). A vector (not per-component) median preserves flow
++    direction and never invents a vector not present in the neighbourhood, so it
++    cannot ghost on its own.
++
++    TWO conservative gates (research_aperture_problem.md Q4 -- ``compute_s`` keys
++    the robustness mask on local flow VARIATION, so smoothing the flow can blind it
++    to moving-object ghosts):
++
++    * ``outlier_thresh`` (px, RECOMMENDED): replace a tile ONLY where it deviates
++      from the window vector-median by more than this many px -- i.e. fix ISOLATED
++      catastrophic block-match outliers (the documented ~2% |flow|>>1 tiles) while
++      leaving COHERENT flow untouched, including real motion boundaries (a boundary
++      tile agrees with its own side's majority, so it is below threshold and kept;
++      and any replacement is a vector that already exists on one side). This
++      preserves the compute_s flow-discontinuity signal because it never smooths a
++      coherent step -- it only removes lone spikes.
++    * ``consistency_span`` (px, ablation): replace ONLY where the 3x3 max-min flow
++      span is <= this cap. On a high-motion (panning/parallax) burst the absolute
++      span is large everywhere, so this gate is over-tight; ``outlier_thresh`` is
++      the robust, scale-aware choice. (If both are None the median is applied
++      everywhere -- NOT recommended; ablation only.)
++
++    ``guide`` (the reference grey, full image) supplies a per-tile mean luma;
++    ``guide_sigma`` > 0 down-weights neighbours whose guide value differs (protects
++    edges/material boundaries). ``guide_sigma == 0`` -> unweighted vector median.
++
++    Returns a new (ny, nx, 2) cupy float32 array.
++    """
++    flow = cp.asarray(flow, dtype=cp.float32)
++    ny, nx, _ = flow.shape
++    r = window // 2
++    fx, fy = flow[..., 0], flow[..., 1]
++
++    # per-tile guide value (mean luma over the tile) for the cross-bilateral weight
++    if guide is not None and guide_sigma > 0 and tile_size is not None:
++        g = cp.asarray(guide, dtype=cp.float32)
++        Ht, Wt = ny * tile_size, nx * tile_size
++        g = g[:Ht, :Wt].reshape(ny, tile_size, nx, tile_size).mean(axis=(1, 3))
++    else:
++        g = None
++
++    # stack the window neighbours (edge-replicated) as (K, ny, nx)
++    fxs, fys, gws = [], [], []
++    offs = list(range(-r, r + 1))
++    for dy in offs:
++        for dx in offs:
++            sx = cp.roll(cp.roll(fx, dy, axis=0), dx, axis=1)
++            sy = cp.roll(cp.roll(fy, dy, axis=0), dx, axis=1)
++            # fix the rolled-in border by edge replication (clamp the shifted index)
++            if dy != 0:
++                if dy > 0:
++                    sx[:dy] = fx[:1]; sy[:dy] = fy[:1]
++                else:
++                    sx[dy:] = fx[-1:]; sy[dy:] = fy[-1:]
++            if dx != 0:
++                if dx > 0:
++                    sx[:, :dx] = sx[:, dx:dx + 1]; sy[:, :dx] = sy[:, dx:dx + 1]
++                else:
++                    sx[:, dx:] = sx[:, dx - 1:dx]; sy[:, dx:] = sy[:, dx - 1:dx]
++            fxs.append(sx); fys.append(sy)
++            if g is not None:
++                gs = cp.roll(cp.roll(g, dy, axis=0), dx, axis=1)
++                if dy > 0:
++                    gs[:dy] = g[:1]
++                elif dy < 0:
++                    gs[dy:] = g[-1:]
++                if dx > 0:
++                    gs[:, :dx] = gs[:, dx:dx + 1]
++                elif dx < 0:
++                    gs[:, dx:] = gs[:, dx - 1:dx]
++                gws.append(gs)
++    FX = cp.stack(fxs, axis=0)  # (K, ny, nx)
++    FY = cp.stack(fys, axis=0)
++    K = FX.shape[0]
++
++    # guide (cross-bilateral) weight per neighbour, relative to the centre tile
++    if g is not None:
++        GW = cp.stack(gws, axis=0)
++        w = cp.exp(-((GW - g[None]) ** 2) / (2.0 * guide_sigma * guide_sigma + 1e-20))
++    else:
++        w = cp.ones((K, ny, nx), dtype=cp.float32)
++
++    # weighted vector median: candidate k minimizes sum_j w_j * ||v_k - v_j||
++    # cost[k] = sum_j w_j * sqrt((FXk-FXj)^2 + (FYk-FYj)^2)
++    dxk = FX[:, None] - FX[None]  # (K, K, ny, nx)
++    dyk = FY[:, None] - FY[None]
++    dist = cp.sqrt(dxk * dxk + dyk * dyk)
++    cost = (dist * w[None]).sum(axis=1)  # (K, ny, nx)
++    best = cp.argmin(cost, axis=0)       # (ny, nx)
++
++    iy, ix = cp.meshgrid(cp.arange(ny), cp.arange(nx), indexing="ij")
++    med_x = FX[best, iy, ix]
++    med_y = FY[best, iy, ix]
++
++    out = flow.copy()
++    if outlier_thresh is not None:
++        # robust outlier gate: replace only tiles that DISAGREE with the window
++        # vector-median by > outlier_thresh px (isolated catastrophic outliers).
++        # Coherent flow (incl. real motion boundaries) is below threshold -> kept,
++        # so the compute_s flow-discontinuity signal is preserved.
++        dev = cp.sqrt((fx - med_x) ** 2 + (fy - med_y) ** 2)
++        apply = dev > cp.float32(outlier_thresh)
++        out[..., 0] = cp.where(apply, med_x, fx)
++        out[..., 1] = cp.where(apply, med_y, fy)
++    elif consistency_span is not None:
++        # 3x3 max-min span of the ORIGINAL flow (matches compute_s's signal); only
++        # replace where the neighbourhood is consistent (span <= cap) so we never
++        # erase the flow-variation the robustness mask rejects ghosts with.
++        span_x = maximum_filter(fx, size=3, mode="nearest") - minimum_filter(fx, size=3, mode="nearest")
++        span_y = maximum_filter(fy, size=3, mode="nearest") - minimum_filter(fy, size=3, mode="nearest")
++        span = cp.sqrt(span_x * span_x + span_y * span_y)
++        apply = span <= cp.float32(consistency_span)
++        out[..., 0] = cp.where(apply, med_x, fx)
++        out[..., 1] = cp.where(apply, med_y, fy)
++    else:
++        out[..., 0] = med_x
++        out[..., 1] = med_y
++    return out
++
++
+ # ---------------------------------------------------------------------------
+ # Block matching, L1 brute-force integer search  (replaces cuda_L1_local_search*)
+ # ---------------------------------------------------------------------------
