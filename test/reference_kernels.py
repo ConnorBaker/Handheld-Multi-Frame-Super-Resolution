@@ -110,7 +110,11 @@ __global__ void accumulate(
         int ikx = (int)kmap_j; int iky = (int)kmap_i;
         float frac_x = kmap_j - (float)ikx;
         float frac_y = kmap_i - (float)iky;
-        int floor_x = ikx>0?ikx:0; int floor_y = iky>0?iky:0;
+        // Clamp floor to the last valid cov cell (not just >=0): an odd LR dim at
+        // x2 scale pushes the last HR pixel's index one past the end, and the
+        // gather below otherwise reads covs out of bounds. The original numba
+        // kernel had this same latent OOB; clamping makes the boundary defined.
+        int floor_x = min(ikx>0?ikx:0, cov_w-1); int floor_y = min(iky>0?iky:0, cov_h-1);
         int ceil_x = min(floor_x+1, cov_w-1);
         int ceil_y = min(floor_y+1, cov_h-1);
         #define COV(yy,xx,a,b) covs[(((yy)*cov_w+(xx))*2 + (a))*2 + (b)]
@@ -174,8 +178,10 @@ __global__ void accumulate_ref(
         float gy, gx;
         if (bayer_mode){ gy = (crp_y-0.5f)/2.0f; gx = (crp_x-0.5f)/2.0f; }
         else { gy = crp_y; gx = crp_x; }
-        int floor_x = (int)floorf(gx); if (floor_x<0) floor_x=0;
-        int floor_y = (int)floorf(gy); if (floor_y<0) floor_y=0;
+        // Clamp floor to the last valid cov cell at both ends (see accumulate):
+        // odd LR dim at x2 scale otherwise indexes covs one past the end.
+        int floor_x = (int)floorf(gx); if (floor_x<0) floor_x=0; if (floor_x>cov_w-1) floor_x=cov_w-1;
+        int floor_y = (int)floorf(gy); if (floor_y<0) floor_y=0; if (floor_y>cov_h-1) floor_y=cov_h-1;
         int ceil_x = min(floor_x+1, cov_w-1);
         int ceil_y = min(floor_y+1, cov_h-1);
         float fx = gx - floorf(gx);

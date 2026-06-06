@@ -61,8 +61,14 @@ def _accumulate_warp(comp: wp.array2d(dtype=wp.float32),
         iky = int(kmap_i)
         frac_x = kmap_j - float(ikx)
         frac_y = kmap_i - float(iky)
-        floor_x = wp.max(ikx, 0)
-        floor_y = wp.max(iky, 0)
+        # Clamp the floor index to the LAST valid cov cell, not just >= 0. For an
+        # odd LR dimension at x2 scale the bottom/right-most HR pixel maps to
+        # kmap == cov_w (one past the end); without the high-side clamp the gather
+        # below reads covs out of bounds. The read returned whatever device memory
+        # neighboured the buffer, so the result was correct in isolation but
+        # diverged under memory-pool churn -- the source of the suite flake.
+        floor_x = wp.clamp(ikx, 0, cov_w - 1)
+        floor_y = wp.clamp(iky, 0, cov_h - 1)
         ceil_x = wp.min(floor_x + 1, cov_w - 1)
         ceil_y = wp.min(floor_y + 1, cov_h - 1)
         top_xx = covs[floor_y, floor_x, 0, 0] + frac_x * (covs[floor_y, ceil_x, 0, 0] - covs[floor_y, floor_x, 0, 0])
@@ -154,8 +160,12 @@ def _accumulate_ref_warp(ref: wp.array2d(dtype=wp.float32),
         else:
             gy = crp_y
             gx = crp_x
-        floor_x = wp.max(int(wp.floor(gx)), 0)
-        floor_y = wp.max(int(wp.floor(gy)), 0)
+        # Clamp the floor index to the LAST valid cov cell, not just >= 0 (see the
+        # comp-path kernel above): an odd LR dim at x2 scale pushes the last HR
+        # pixel's floor index to cov_w/cov_h, one past the end, and the bilinear
+        # gather below would read covs out of bounds (the suite-flake root cause).
+        floor_x = wp.clamp(int(wp.floor(gx)), 0, cov_w - 1)
+        floor_y = wp.clamp(int(wp.floor(gy)), 0, cov_h - 1)
         ceil_x = wp.min(floor_x + 1, cov_w - 1)
         ceil_y = wp.min(floor_y + 1, cov_h - 1)
         fx = gx - wp.floor(gx)
