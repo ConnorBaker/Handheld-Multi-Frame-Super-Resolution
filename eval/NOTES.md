@@ -561,3 +561,22 @@ bicubic 0.0062 vs nearest-vs-bicubic 0.0129), edge sharpness preserved/improved
 the fit), full suite 230 passed. bicubic is marginally smoother (C1) but risks flow
 overshoot at motion/depth boundaries, so bilinear is the safe default. A concrete
 step toward the continuous formulation (continuous flow vs piecewise-constant tiles).
+
+### Out-resolve DxO at <=1x? PARITY, not a beat (eval/_resolution_sweep.py)
+
+Downscaled our scale=2 (bilinear-flow, de-aliased) merge + gated deconv and DxO's
+single-frame output to 1.0/0.75x; matched physical edge sigma (sensor px):
+  1.00x: DxO 1.81 vs ours+deconv 1.88   |   0.75x: DxO 1.98 vs ours 1.90
+=> PARITY within +-0.07px (measurement noise); neither out-resolves the other on
+resolvable edges. (Fairness matters: comparing our RAW merge to DxO's DECONVOLVED
+render wrongly showed DxO leading; with OUR deconv it's a tie.) At 0.5x edge sigma is
+filter-limited (both ~1px output edges, esf unreliable); the coarse louvers resolve
+in both (not aliased -> no anti-aliasing difference on this content).
+
+Why no out-resolve win here: multi-frame's genuine resolution advantage is
+ANTI-ALIASING of NEAR-NYQUIST content (detail a single frame aliases) -- this scene's
+columns/louvers are RESOLVABLE (not aliased), so they don't engage it, and DxO's
+deconvolution handles resolvable edges fine. A definitive out-resolve demo needs a
+fine resolution chart near the sensor Nyquist. Durable wins remain: real-detail
+HONESTY (DxO hallucinates ~24% fine texture; ours doesn't), noise, and the
+block-artifact fix (continuous flow).
