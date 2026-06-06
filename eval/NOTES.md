@@ -580,3 +580,42 @@ deconvolution handles resolvable edges fine. A definitive out-resolve demo needs
 fine resolution chart near the sensor Nyquist. Durable wins remain: real-detail
 HONESTY (DxO hallucinates ~24% fine texture; ours doesn't), noise, and the
 block-artifact fix (continuous flow).
+
+### Why we don't out-resolve DxO: edges are OPTICS-limited, not sampling-limited (VERIFIED)
+
+Diagnosed + independently verified the parity result.
+- Our scale=2 IS genuine SR, not interpolation: SR-band power (above the 1x Nyquist)
+  is ~7.5x (crop) / ~9.7x (tile median) a bicubic-upsampled scale=1; synthetic SR is
+  ~+3 dB vs single-frame. SR works -- on SAMPLING-limited content.
+- Matched physical edge sigma: single bilinear-demosaiced frame 2.06 ~ s1 merge 2.10
+  ~ s2 merge 2.08 (all ~2.1) >> DxO 1.71. A SINGLE frame is already ~2.06px; the
+  merge/SR barely change it. The edge is set by the PER-FRAME optical/sensor MTF
+  (~2.1px), which is in every sample's SIGNAL, not the sampling -- SR adds density,
+  cannot deblur optics. So scale1~scale2~single on edges, and parity (not beat) holds
+  because DxO's DECONVOLUTION closes the last ~0.3px (2.06->1.71).
+- Mechanistic proof (synthetic, injected optical PSF sweep): multi-vs-single edge
+  gain collapses +0.30px (no PSF) -> +0.03px at sigma~2.1 (real sensor). Optics-
+  limited edges get ZERO SR benefit; sampling-limited texture gets the full benefit.
+  Matches Wronski's own ceiling ("significant at 1.5x, small to 2x, none after";
+  optical sampling ratio ~1.5-1.8 < critical 2.0). Baker-Kanade's ~1.6x wall rests on
+  8-bit inputs; we merge 14-bit raw, so that wall is much looser -- the binding
+  limits are codebase-controlled (below).
+
+LEVERS (verified / ranked):
+1. To beat DxO ON EDGES: DECONVOLUTION (the optical MTF), NOT more SR. We have it
+   (postprocessing.aberration.deblur_method=measured_rl, opt-in; calibrate sigma~2.1
+   per burst via eval/calibrate_deconv). This is the path to DxO-edge sharpness from
+   REAL (non-hallucinated) detail.
+2. For TEXTURE HF: k_detail 0.25->0.18 gave +48% SR-band HF; the merge kernel
+   footprint is fixed in LR px (scale-invariant), so scale=2 interpolates in the
+   kernel-killed band -- scaling k_detail with 1/scale would make scale=2 actually
+   resolve there (algorithmic change, not yet done).
+3. Alignment: median ICA residual 0.063px (fine) but 26% of tiles >0.2px
+   (foliage/parallax) -> ica.n_iter 3->6 + robustness.t. Denser/continuous per-pixel
+   flow is the research direction (research_continuous_formulation.md S6).
+NOT limiters (ruled out): sub-pixel sampling diversity (ideal), merge denoise band
+(inert), the CuPy/Warp port (synthetic SR cleanly beats baselines).
+Research S6 (continuous HF recovery): registration precision + continuous flow
+(highest confidence), field-varying PSF inverse + B-spline resample, adaptive-
+bandwidth/N=1 kernel regression, frequency-domain (Papoulis-Gerchberg) de-aliasing
+-- recover HF the pipeline currently WASTES; none beats the optics sampling-ratio cap.
