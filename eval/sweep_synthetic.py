@@ -22,8 +22,16 @@ applied per frame in ``synthetic.make_synthetic_burst``) so the deblur/defringe
 have a real degradation to invert -- without it the merge already removes
 everything the GT comparison can see and post-processing can only amplify noise.
 
+PER-BURST mode (``--dxo-ref``): use NATIVE-RES crops of a DxO reference as the GT
+instead of the Canon JPEGs -- content-matched to a real shot, parallax-free, and
+professionally lens-corrected. Crops (not downscaled) + the burst's REAL sensor
+noise (``--burst``) keep the scale/SNR/displacement regime identical to the real
+burst, so the tuned params transfer (downscaling would change the SNR). Defaults to
+``factor=1`` (synthetic LR at the real native resolution). Same Optuna study/sampler.
+
 Usage:
     python -m eval.sweep_synthetic --trials 120 --outdir results/eval/sweep_synth_v2
+    python -m eval.sweep_synthetic --dxo-ref ref.dng --burst <burst_dir> --trials 120
 """
 
 import argparse
@@ -69,6 +77,36 @@ def load_scenes(scenes=SCENES):
     if not gts:
         raise RuntimeError("no scenes found")
     return gts
+
+
+def load_dxo_scenes(dxo_ref_path, n=3, size=1024, margin=0.1):
+    """Extract ``n`` high-detail, non-overlapping NATIVE-RES crops from a DxO
+    reference, to use as per-burst GT scenes (content-matched to the real shot).
+
+    Native-res CROPS -- deliberately NOT downscaled: downscaling averages pixels,
+    which raises the SNR and so shifts the SNR-resolved params (k_detail/k_denoise/
+    D_th, robustness) and convergence (ica.n_iter) into a regime that won't transfer
+    to the real full-res burst. A crop preserves scale, SNR and displacement; the
+    real per-burst noise is injected separately (run_sweep's alpha/beta).
+    """
+    from .calibrate_optics import read_dng
+    img = read_dng(str(dxo_ref_path))
+    H, W = img.shape[:2]
+    m = int(min(H, W) * margin)
+    grad = np.hypot(*np.gradient(img.mean(2).astype(np.float64)))
+    cands = sorted(((float(grad[y:y + size, x:x + size].mean()), y, x)
+                    for y in range(m, H - size - m, size // 2)
+                    for x in range(m, W - size - m, size // 2)), reverse=True)
+    chosen, taken = [], []
+    for _, y, x in cands:
+        if all(abs(y - ty) >= size or abs(x - tx) >= size for ty, tx in taken):  # non-overlapping
+            chosen.append(np.ascontiguousarray(img[y:y + size, x:x + size]))
+            taken.append((y, x))
+            if len(chosen) >= n:
+                break
+    if not chosen:
+        raise RuntimeError(f"no {size}px crops fit in {dxo_ref_path} ({H}x{W})")
+    return chosen
 
 
 def suggest(trial):
@@ -151,18 +189,18 @@ def _apply_post(out, post):
     return out
 
 
-def score_config(gts, bursts, overrides):
+def score_config(gts, bursts, overrides, factor=2):
     """Mean fidelity loss over scenes for one config (bursts precomputed).
 
-    Runs the merge, then the swept post-processing (deblur/aberration), then
-    scores the *post-processed* output vs GT -- so the new components are in the
-    objective. PSNR is tracked alongside (it penalizes the noise amplification /
-    over-sharpening that SSIM+DISTS are softer on).
+    Runs the merge at ``scale=factor``, then the swept post-processing
+    (deblur/aberration), then scores the *post-processed* output vs GT -- so the
+    new components are in the objective. PSNR is tracked alongside (it penalizes
+    the noise amplification / over-sharpening that SSIM+DISTS are softer on).
     """
     losses, ssims, dists, sharps, psnrs = [], [], [], [], []
     for gt, burst in zip(gts, bursts):
         ov = dict(overrides or {})
-        ov["scale"] = 2
+        ov["scale"] = factor
         out, cfg = pr.run(burst, ov)
         out = _apply_post(out, cfg.postprocessing)
         loss, s, d = fidelity(out, gt)
@@ -173,23 +211,27 @@ def score_config(gts, bursts, overrides):
             float(np.mean(sharps)), float(np.mean(psnrs)))
 
 
-def run_sweep(n_trials=60, outdir="results/eval/sweep_synth", study_name="synth_fidelity", seed=0):
+def run_sweep(n_trials=60, outdir="results/eval/sweep_synth", study_name="synth_fidelity", seed=0,
+              gts=None, alpha=1e-4, beta=0.0, factor=2, n_frames=8):
     os.makedirs(outdir, exist_ok=True)
     optuna.logging.set_verbosity(optuna.logging.WARNING)
-    gts = load_scenes()
+    if gts is None:
+        gts = load_scenes()
     # precompute synthetic bursts once (same noisy LR frames for every trial -> fair).
-    # OPTICS injects a known PSF + lateral CA so deblur/aberration have a real target.
-    bursts = [syn.make_synthetic_burst(gt, n=8, alpha=1e-4, seed=i, **OPTICS)[0]
-              for i, gt in enumerate(gts)]
-    print(f"[scenes] {len(gts)} GT crops")
+    # OPTICS injects a known PSF + lateral CA so deblur/aberration have a real target;
+    # alpha/beta are the (real, per-burst) sensor noise so the SNR regime matches.
+    bursts = [syn.make_synthetic_burst(gt, n=n_frames, factor=factor, alpha=alpha, beta=beta,
+                                       seed=i, **OPTICS)[0] for i, gt in enumerate(gts)]
+    print(f"[scenes] {len(gts)} GT crops | factor={factor} n_frames={n_frames} "
+          f"alpha={alpha:.2e} beta={beta:.2e}")
 
-    base_loss, base_s, base_d, base_sh, base_psnr = score_config(gts, bursts, None)
+    base_loss, base_s, base_d, base_sh, base_psnr = score_config(gts, bursts, None, factor)
     print(f"[ref] default (shipped postproc): loss={base_loss:.4f} SSIM={base_s:.4f} "
           f"DISTS={base_d:.4f} PSNR={base_psnr:.2f} sharp/gt={base_sh:.3f}")
 
     def objective(trial):
         try:
-            loss, s, d, sh, ps = score_config(gts, bursts, suggest(trial))
+            loss, s, d, sh, ps = score_config(gts, bursts, suggest(trial), factor)
         except Exception as exc:
             trial.set_user_attr("error", str(exc)[:200])
             return 1.0
@@ -216,7 +258,7 @@ def run_sweep(n_trials=60, outdir="results/eval/sweep_synth", study_name="synth_
         for p in parts[:-1]:
             d = d.setdefault(p, {})
         d[parts[-1]] = v
-    best_nested["scale"] = 2
+    best_nested["scale"] = factor
     OmegaConf.save(OmegaConf.create(best_nested), os.path.join(outdir, "best_config.yaml"))
     out = dict(default=dict(loss=base_loss, SSIM=base_s, DISTS=base_d, PSNR=base_psnr, sharp_ratio=base_sh),
                best=dict(loss=study.best_value, **{k: bt.user_attrs.get(k) for k in ("SSIM", "DISTS", "PSNR", "sharp_ratio")}),
@@ -242,8 +284,27 @@ class _Frozen:
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--trials", type=int, default=60)
     ap.add_argument("--outdir", default="results/eval/sweep_synth")
+    ap.add_argument("--dxo-ref", help="DxO reference DNG: use its native-res crops as GT "
+                                      "(per-burst, content-matched)")
+    ap.add_argument("--burst", help="raw burst dir: take its real sensor noise (alpha,beta)")
+    ap.add_argument("--frames", type=int, default=8, help="synthetic burst frame count")
+    ap.add_argument("--factor", type=int, default=None,
+                    help="SR factor; default 2 for the Canon scenes, 1 for --dxo-ref "
+                         "(keeps the synthetic LR at the real burst's native resolution)")
     args = ap.parse_args()
-    run_sweep(n_trials=args.trials, outdir=args.outdir)
+
+    if args.dxo_ref:
+        gts = load_dxo_scenes(args.dxo_ref)
+        alpha, beta = 1e-4, 0.0
+        if args.burst:
+            from . import pipeline_runner as pr
+            b = pr.load_burst_arw(args.burst, max_frames=2)
+            alpha, beta = float(b["alpha"]), float(b["beta"])
+        run_sweep(n_trials=args.trials, outdir=args.outdir, study_name="dxo_fidelity",
+                  gts=gts, alpha=alpha, beta=beta, factor=args.factor or 1, n_frames=args.frames)
+    else:
+        run_sweep(n_trials=args.trials, outdir=args.outdir, factor=args.factor or 2,
+                  n_frames=args.frames)
