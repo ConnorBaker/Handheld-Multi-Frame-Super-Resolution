@@ -121,6 +121,199 @@ def deblur(img, deconv_sigma, method="rl", iters=10, nsr=1e-2, clip=True):
 
 
 # ---------------------------------------------------------------------------
+# Field-varying, edge-gated deconvolution
+#
+# A verified adversarial pass (eval/NOTES.md) showed the merge PSF is FIELD-VARYING
+# (edge sigma ~0.9-2.4 px across the scene), so a single GLOBAL deconv sigma
+# over-sharpens the already-sharp regions, and plain RL amplifies flat-region noise.
+# Two fixes, both measured: (1) gate the sharpening to actual EDGES via the
+# structure-tensor edge strength (the pipeline's steerable-kernel signal, NOT the
+# robustness mask, which is cross-frame agreement -- ~constant on a static scene);
+# (2) estimate the LOCAL PSF per tile and deconvolve each tile to a common target.
+# ---------------------------------------------------------------------------
+
+def _to_np(img):
+    """View an (H,W) torch tensor or array as a float32 numpy array (no copy of a
+    cpu tensor's storage). Returns (array, was_tensor, device)."""
+    if isinstance(img, torch.Tensor):
+        return img.detach().cpu().numpy().astype(np.float32, copy=False), True, img.device
+    return np.asarray(img, dtype=np.float32), False, None
+
+
+def edge_gate(luma, lo_pct=50, hi_pct=90, win=5):
+    """Structure-tensor edge-strength map in [0,1] (HxW float32), used to gate
+    sharpening to real edges (flats left untouched).
+
+    Mirrors ``cupy_ops.estimate_cov_cupy``: Sobel gradients -> box-filter the 2x2
+    structure tensor (a=Sum gx^2, b=Sum gx*gy, d=Sum gy^2) over a `win`x`win`
+    window -> closed-form max eigenvalue l1=(tr+sqrt((a-d)^2+4b^2))/2. The edge
+    strength is sqrt(l1) (across-edge gradient energy), smoothstep-normalized
+    between the lo/hi percentiles of that strength so the map is ~0 on flats and
+    ~1 on strong edges. cv2/numpy only (runs on CPU)."""
+    import cv2
+    a = np.asarray(luma, dtype=np.float32)
+    gx = cv2.Sobel(a, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(a, cv2.CV_32F, 0, 1, ksize=3)
+    box = lambda m: cv2.boxFilter(m, cv2.CV_32F, (win, win), normalize=False)
+    sa = box(gx * gx)            # a
+    sb = box(gx * gy)            # b (= [0,1] = [1,0])
+    sd = box(gy * gy)            # d
+    tr = sa + sd
+    disc = np.sqrt(np.clip((sa - sd) ** 2 + 4.0 * sb * sb, 0, None))
+    l1 = 0.5 * (tr + disc)       # max eigenvalue (across-edge energy)
+    strength = np.sqrt(np.clip(l1, 0, None))
+    lo, hi = np.percentile(strength, [lo_pct, hi_pct])
+    t = np.clip((strength - lo) / (hi - lo + 1e-12), 0.0, 1.0)
+    g = t * t * (3.0 - 2.0 * t)  # smoothstep
+    return g.astype(np.float32)
+
+
+def _flat_noise_std(img, win=200, y=200, x=2600, hp_sigma=2.0):
+    """High-pass std of a flat patch (default the facade scene's sky crop), the
+    noise floor the deconv must not exceed. Falls back to a darkest-variance patch
+    if the default crop is out of bounds (e.g. a synthetic test image)."""
+    import cv2
+    H, W = img.shape
+    if y + win <= H and x + win <= W:
+        c = img[y:y + win, x:x + win]
+    else:                                  # pick the lowest-gradient win-tile
+        w = min(win, H, W)
+        grad = (np.abs(cv2.Sobel(img, cv2.CV_32F, 1, 0, 3))
+                + np.abs(cv2.Sobel(img, cv2.CV_32F, 0, 1, 3)))
+        gm = cv2.boxFilter(grad, cv2.CV_32F, (w, w), normalize=True)
+        valid = gm[: H - w + 1, : W - w + 1]      # top-left corners that fit a w-tile
+        yy, xx = np.unravel_index(int(np.argmin(valid)), valid.shape)
+        c = img[yy:yy + w, xx:xx + w]
+    return float((c - cv2.GaussianBlur(c.astype(np.float32), (0, 0), hp_sigma)).std())
+
+
+def deblur_gated(img, deconv_sigma, method="rl", iters=5, denoise="bilateral",
+                 denoise_strength=None, gate=True, **kw):
+    """Edge-gated, noise-controlled deblur. Same input/output type as ``deblur``.
+
+    Deconvolve (via ``deblur``), then blend only at edges -- ``img + g*(out-img)``
+    with ``g=edge_gate(img)`` (g=1 to disable) -- so flats are not sharpened. Then
+    optionally an edge-preserving bilateral (``cv2.bilateralFilter``) strips the
+    noise the deconv amplified while keeping texture; ``sigma_color`` auto-scales to
+    ~3x the measured flat-region noise std when ``denoise_strength is None``. On the
+    facade merge this reaches DxO's edge sigma with flat-sky noise AT/BELOW the raw
+    merge (eval/NOTES.md). KEEP THIS SIGNATURE -- another component calls it."""
+    import cv2
+    arr, was_tensor, dev = _to_np(img)
+    base = torch.as_tensor(arr)
+    out = deblur(base, deconv_sigma, method=method, iters=iters, **kw).cpu().numpy()
+    if gate:
+        g = edge_gate(arr) if gate is True else np.asarray(gate, np.float32)
+        out = arr + g * (out - arr)
+    out = out.astype(np.float32)
+    if denoise == "bilateral":
+        sc = denoise_strength
+        if sc is None:
+            sc = 3.0 * _flat_noise_std(arr)
+        sc = max(float(sc), 1e-4)
+        out = cv2.bilateralFilter(np.ascontiguousarray(out), d=5,
+                                  sigmaColor=sc, sigmaSpace=3)
+    out = np.clip(out, 0.0, 1.0).astype(np.float32)
+    return torch.as_tensor(out).to(dev) if was_tensor else out
+
+
+def _raised_cosine_2d(h, w, oy, ox):
+    """Separable raised-cosine (Hann) feather window, ramping over the `oy`/`ox`
+    overlap margins and flat (=1) in the tile interior. Sums to ~1 across tiles
+    laid on a 50%-or-more overlap grid, so feathered tiles blend seamlessly."""
+    def ramp(n, o):
+        w1 = np.ones(n, np.float32)
+        if o > 0:
+            r = 0.5 * (1.0 - np.cos(np.pi * (np.arange(o) + 0.5) / o))
+            w1[:o] = r
+            w1[-o:] = r[::-1]
+        return w1
+    return np.outer(ramp(h, oy), ramp(w, ox)).astype(np.float32)
+
+
+def _local_sigma(tile, fallback_sigma, rms_max=0.04, band=60, min_contrast=0.05):
+    """Local merge-PSF sigma in a tile: ESF sigma of the strongest CLEAN near-vertical
+    step edge inside it (good erf fit + real contrast), else `fallback_sigma`. Reuses
+    eval.hallucination.find_step_edges (single-tile search) + eval.psf.esf_sigma."""
+    from .hallucination import find_step_edges
+    from .psf import esf_sigma
+    h, w = tile.shape
+    sz = min(140, h - 2, w - 2)
+    # fine stride so a search window lands centred on an isolated edge (a coarse
+    # stride misses lone edges -- it only works on the busy full frame by luck).
+    edges = find_step_edges(tile, sz=sz, bw=min(60, w - 2),
+                            stride=max(16, sz // 8), margin=max(8, sz // 2 + 2),
+                            min_contrast=min_contrast, max_edges=4, min_sep=sz // 2)
+    for cy, cx, *_ in edges:                       # strongest first
+        b = max(8, band // 2)
+        sub = tile[cy - sz // 2:cy + sz // 2, cx - b:cx + b]
+        if sub.shape[0] < 12 or sub.shape[1] < 8:
+            continue
+        s, rms = esf_sigma(sub)
+        if np.isfinite(s) and rms < rms_max and 0.4 < s < 4.0:
+            return float(s), True
+    return float(fallback_sigma), False
+
+
+def deblur_field_varying(img, target_sigma=1.87, tile=512, overlap=0.25, method="rl",
+                         fudge=1.08, fallback_sigma=2.0, **kw):
+    """Field-varying measured-PSF deconvolution: estimate the LOCAL merge PSF per
+    overlapping tile and deblur each tile to a common `target_sigma`, so already-sharp
+    regions are deconvolved gently and soft regions strongly (the fix the global deconv
+    lacked -- a single sigma over-sharpens the sharp field). Returns a float32 (H,W).
+
+    Two passes so the PSF FIELD is smooth (not blindly global): (1) measure the
+    local sigma per tile -- ESF on the strongest clean step edge inside it
+    (``_local_sigma``); (2) tiles with no clean edge (e.g. an edge that fell in the
+    tile's measurement margin, or a flat tile) INHERIT the median of the tiles that
+    did measure, so a soft region is not under-deconvolved by a blind fallback (only
+    if NO tile measured is `fallback_sigma` used); (3) per tile
+    ``deconv_sigma=fudge*partial_gaussian_sigma(local_sigma, target_sigma)`` (the
+    ~8% fudge is the real edge's non-Gaussian tail), ``deblur_gated`` the tile, and
+    feather-blend the overlapping tiles with a raised-cosine window. `**kw` flows to
+    deblur_gated (iters/denoise/...)."""
+    arr, was_tensor, dev = _to_np(img)
+    H, W = arr.shape
+    step = max(1, int(round(tile * (1.0 - overlap))))
+    ov = (tile - step + 1) // 2                    # feather margin (>=1 if overlap>0)
+    ys = list(range(0, max(1, H - tile + 1), step))
+    xs = list(range(0, max(1, W - tile + 1), step))
+    if ys[-1] != max(0, H - tile):
+        ys.append(max(0, H - tile))
+    if xs[-1] != max(0, W - tile):
+        xs.append(max(0, W - tile))
+
+    # pass 1: measure the local PSF sigma where a clean edge exists
+    sig = np.full((len(ys), len(xs)), np.nan, np.float32)
+    for iy, y0 in enumerate(ys):
+        for ix, x0 in enumerate(xs):
+            t = arr[y0:y0 + min(tile, H - y0), x0:x0 + min(tile, W - x0)]
+            s, ok = _local_sigma(t, np.nan)
+            if ok:
+                sig[iy, ix] = s
+    measured = np.isfinite(sig)
+    field_med = float(np.median(sig[measured])) if measured.any() else float(fallback_sigma)
+    sig = np.where(measured, sig, field_med)       # inherit field median where unmeasured
+
+    # pass 2: deconvolve each tile to the common target and feather-blend
+    acc = np.zeros((H, W), np.float32)
+    wsum = np.zeros((H, W), np.float32)
+    for iy, y0 in enumerate(ys):
+        for ix, x0 in enumerate(xs):
+            th, tw = min(tile, H - y0), min(tile, W - x0)
+            t = arr[y0:y0 + th, x0:x0 + tw]
+            ds = fudge * partial_gaussian_sigma(float(sig[iy, ix]), target_sigma)
+            out_t = deblur_gated(t, ds, method=method, **kw)
+            if isinstance(out_t, torch.Tensor):
+                out_t = out_t.cpu().numpy()
+            win = _raised_cosine_2d(th, tw, min(ov, th // 2), min(ov, tw // 2))
+            acc[y0:y0 + th, x0:x0 + tw] += out_t * win
+            wsum[y0:y0 + th, x0:x0 + tw] += win
+    out = (acc / np.maximum(wsum, 1e-8)).astype(np.float32)
+    return torch.as_tensor(out).to(dev) if was_tensor else out
+
+
+# ---------------------------------------------------------------------------
 # NVIDIA Warp -- separable Gaussian convolution kernel (a spatial alternative to
 # Warp's device-side wp.tile_fft, verified available here). Benchmarked against
 # torch/cupy; RL's per-iter blur is the only conv it needs (Gaussian is symmetric

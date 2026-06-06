@@ -495,3 +495,23 @@ did not). All re-verified on the cached merge/stack:
   w1*DISTS_vs_GT + w2*|edge_sigma-target| + w3*max(0,flat_noise-merge_noise) +
   w4*max(0,overshoot-merge_overshoot) so it cannot win by over-sharpening/noise (the
   failure that broke the old Canon-DISTS sweep).
+
+### Field-varying edge-gated deconvolution (eval/deconv.py)
+
+Added `edge_gate` (structure-tensor sqrt(l1) -- the steerable-kernel signal, NOT
+the robustness mask), `deblur_gated` (gate + edge-preserving bilateral), and
+`deblur_field_varying` (per-tile local-PSF estimate -> per-tile deconv -> feather
+blend). VERIFIED field-wide with fit-reliability flags (the discipline the global
+result lacked):
+- On the 4 edges where BOTH DxO and the merge erf-fit cleanly (rms<0.04):
+  **DxO 1.71, raw merge 2.10, global-RL 1.84, field-varying 1.88 px.** Measured-PSF
+  deconv CLOSES ~half the merge->DxO gap but does NOT reach DxO -- DxO's per-region
+  deconvolution is stronger. (An "all-8 median 1.50 < DxO 1.57" looked like a win
+  but is contaminated by 4 thin-bar edges with bad fits ~0.5 px; gate on fit
+  reliability before quoting a distribution.)
+- Tradeoff: field-varying controls flat NOISE far better (flat-sky 0.96x raw, BELOW
+  the merge, vs global-RL 1.63x) via the gate+bilateral; global-RL is marginally
+  sharper by sharpening noise too.
+- The residual gap to DxO is NOT closeable by more deconvolution. Beating DxO needs
+  real sub-pixel detail: SUPER-RESOLUTION (scale=2, untested here) + field-varying
+  deconv, vs DxO's single-frame guess.
