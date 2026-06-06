@@ -515,3 +515,32 @@ result lacked):
 - The residual gap to DxO is NOT closeable by more deconvolution. Beating DxO needs
   real sub-pixel detail: SUPER-RESOLUTION (scale=2, untested here) + field-varying
   deconv, vs DxO's single-frame guess.
+
+### "Beat DxO at every resolution?" -- honest MATCHED result (eval/_beat_dxo_matched.py)
+
+Ran scale=1 AND scale=2 SR merges on the 007 burst (eval/_run_scale2.py),
+auto-calibrated gated measured-PSF deconv (eval/calibrate_deconv.py auto merge
+sigma = 1.96, high-conf), and compared PHYSICAL edge resolution to DxO -- MATCHED
+(same physical edges, reliability-gated; NOT the convenient-sample trap):
+
+  physical edge sigma (sensor px; median over 4 reliably-fit MATCHED edges):
+    DxO 1.71 | s1 2.10 | s1+deconv 1.81 | s2 2.15 | s2+deconv 1.81
+
+- We MATCH DxO closely (1.81 vs 1.71) but do NOT beat it on edge sharpness, at
+  scale=1 OR scale=2. DxO's single-frame deconvolution is strong, and scale=2 SR
+  does NOT help these edges (s2 2.15 ~ s1 2.10): the building columns are COARSE,
+  already resolved at 1x, so SR (whose advantage is sub-Nyquist detail) has nothing
+  to add there.
+- LESSON AGAIN: a NON-matched distribution gave s2+deconv 1.43 < DxO 1.71 ("beat!"),
+  but it compared different edge SETS; the MATCHED comparison shows ~1.81 = no beat.
+  The cross-scale s2 sigma measurement (upsample 1x template -> align in 2x -> /2)
+  is itself fragile; what's robust is "neither clearly beats DxO on these edges."
+- Where we genuinely win: REAL-DETAIL HONESTY (DxO hallucinates ~24% of fine
+  texture, per-frame inconsistent; ours is multi-frame-real) and ABOVE-native output
+  (DxO has no SR -> bicubic; we have real fusion; at 2x our surface is cleaner --
+  beat_dxo_2x.png, with a faint block artifact in the scale=2 deconv to investigate).
+- "Beat at EVERY resolution" on edge sharpness is NOT supported by the data here. A
+  definitive SR-beats-DxO demonstration needs a SUB-NYQUIST / resolution-chart
+  target (coarse building edges can't isolate the SR gain) -- and that regime is
+  exactly where DxO hallucinates, so the honest framing is real-detail vs
+  invented-detail, not sharper-vs-softer.
