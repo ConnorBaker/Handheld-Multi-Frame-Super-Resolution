@@ -166,3 +166,7 @@ test_burst/
 
 # eval/sweep generated artifacts (large)
 results/
+
+# eval: hallucination analysis cache + regenerable outputs (multi-GB luma stack,
+# merge, montages/heatmap). Regenerate with: python -m eval._halluc_run
+eval/halluc_out/

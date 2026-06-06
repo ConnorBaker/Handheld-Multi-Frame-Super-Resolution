@@ -277,3 +277,56 @@ align/block-matching/Hessian ops if those are ever moved off torch.
   The fidelity sweep's config is the defensible one; the biggest real lever is
   **alignment iterations + robustness rejection**, not the merge kernel or patch
   size.
+
+## Real vs hallucinated detail — DxO 41-frame burst (`eval/hallucination.py`)
+
+The user shot a 41-frame handheld burst (Sony a6300, ISO 200, dusk park) and
+exported a per-frame DxO PhotoLab **DeepPRIME** render of every frame
+(`*_DxO-reference.dng`, scene-linear). That gives **41 independent single-frame
+reconstructions of the SAME static scene** at different sub-pixel offsets — the
+setup needed to separate REAL detail from HALLUCINATED detail without a ground
+truth.
+
+**Principle.** DeepPRIME is a single-image learned reconstructor. Real scene
+detail is **cross-frame consistent** (static scene, fixed optics) and survives a
+cross-frame consensus; noise/aliasing-seeded **invention** is per-frame and is
+destroyed by the consensus. On a per-ROI registered stack the single-frame HF
+power splits orthogonally into consistent (REAL) + per-frame (invented + noise);
+`real_fraction = consistent / total`.
+
+**Method validity (all executable, in `test/test_hallucination.py` + the driver):**
+- Shift convention round-trips; **resampling-only control scores `real_fraction`
+  0.90–0.998**, so low values are genuine, not cubic-interpolation artifacts.
+- The burst PANS ~71 px with **parallax** (corner spread to 48 px at ~0° rotation),
+  so registration is **per-ROI** (template-match + sub-pixel phase corr), never a
+  single global homography — different depths register independently.
+
+**Findings.**
+- **≈77 % of DxO's single-frame HF energy is cross-frame REAL; ≈23 % is per-frame
+  (invented + residual noise)** (HF-power-weighted over ~300 tiles). This 77 % is
+  an **upper bound on real**: DeepPRIME is deterministic, so *scene-conditioned*
+  hallucination repeats every frame and is miscounted as real — cross-frame
+  consistency only catches the *noise/aliasing-seeded* kind.
+- **Noise vs invention** (`inconsistency_structure`): in **flat sky** the
+  inconsistent component is **white** (lag-1 autocorr ≈ 0.01 vs 0.00 control) =
+  residual under-denoising; in **textured regions** it is **structured at ~3 px**
+  (autocorr 0.42–0.48) = synthesized texture. Visible in the montages: tree/bush
+  *shape* is identical across frames 0/20/40 but the fine *leaf texture differs*.
+- **Cross-check vs our prior-free multi-frame merge:** HF(merge) ≈ HF(DxO
+  consensus) on real detail (bush ratio 0.97) — two independent reconstructions
+  converging on the same "real" detail. Our merge keeps only the consistent ~77 %
+  and skips the per-frame invention.
+
+**Honest negatives (do not overstate):**
+- The scene has **no clean step edges** (0 found even at relaxed thresholds:
+  natural foliage/sky/grass; man-made bits are thin bars, not steps), so the
+  edge-width (ESF) check is **legitimately N/A** here. The earlier
+  "merge σ1.58 < DxO σ1.97" claim **did not reproduce** and was dropped;
+  `eval/psf.py` (validated ESF estimator, round-trips σ≥0.8 to ±0.02) and
+  `find_step_edges` / `compare_edge_sharpness` are kept for a scene that has them.
+- In **vegetation**, wind motion is also cross-frame inconsistent and is **not
+  separable** from invention here — needs a static high-contrast target.
+
+**Reproduce:** `python -m eval._halluc_run --burst <dxo_dng_dir> --out eval/halluc_out
+[--merge auto|merge.npy]`. Cache + montages/heatmap land in `eval/halluc_out/`
+(gitignored, multi-GB).
