@@ -111,12 +111,35 @@ def calibrate(plain_rgb, corrected_rgb):
     return dict(
         ca_R=round(ca_r, 3), ca_B=round(ca_b, 3), ca_px=round(ca_px, 3),
         psf_sigma=round(sigma, 3),
-        OPTICS=dict(psf_sigma=round(sigma, 3), psf_sigma_corner=round(sigma, 3), ca_px=round(ca_px, 3)),
+        # faithful (asymmetric) injection -- real lenses split R/B unevenly
+        OPTICS=dict(psf_sigma=round(sigma, 3), psf_sigma_corner=round(sigma, 3),
+                    ca_R=round(ca_r, 3), ca_B=round(ca_b, 3)),
     )
 
 
+def read_dng(path):
+    """Read a DEMOSAICED (linear) DNG -- e.g. DxO's linear-DNG export -- as RGB [0,1].
+
+    DxO stores the full-res linear RGB as a JPEG-compressed uint16 TIFF IFD; rawpy
+    (libraw) decompresses it to ``raw_image`` (H,W,4) with the 4th plane empty, so we
+    take [R,G,B] / white_level. (tifffile needs the optional ``imagecodecs`` package
+    for that JPEG, and imageio grabs the thumbnail IFD -- rawpy is the dependency-free
+    path; verified on DxO ILCE-6300 linear DNGs.)
+    """
+    import rawpy
+    with rawpy.imread(path) as raw:
+        ri = raw.raw_image
+        if ri.ndim != 3:
+            raise ValueError(f"{path}: expected a demosaiced/linear DNG, got a {ri.ndim}D raw "
+                             "(Bayer DNG). Export DxO as a linear DNG.")
+        a = ri[..., :3].astype(np.float32) / float(raw.white_level)
+    return np.clip(a, 0, 1)
+
+
 def _load(path):
-    """Load an RGB [0,1] float image from .npy or any imageio-readable file (8/16-bit)."""
+    """Load RGB [0,1]: .dng (linear, via rawpy), .npy, or imageio (8/16-bit TIFF/PNG)."""
+    if path.lower().endswith(".dng"):
+        return read_dng(path)
     if path.endswith(".npy"):
         a = np.load(path)
     else:

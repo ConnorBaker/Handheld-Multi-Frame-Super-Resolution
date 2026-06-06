@@ -49,12 +49,14 @@ SCENES = [
     ("test_burst/Samsung_dataset/0050/Canon/im.JPG", 1200, 2600, 1024),
 ]
 
-# Known optical degradation injected into the synthetic forward model (px at GT
-# 2x scale) so the deblur/aberration stages have a real PSF + lateral CA to invert
-# and the clean-GT comparison can reward them. Field-varying blur (sharper centre,
-# blurrier corner) + radial R/B chromatic shift. Provisional, moderate values --
-# calibrate from a real lens (e.g. DxO lens-measured corrections) when available.
-OPTICS = dict(psf_sigma=1.2, psf_sigma_corner=2.0, ca_px=2.5)
+# Optical degradation injected into the synthetic forward model so the deblur/
+# aberration stages have a real PSF + lateral CA to invert (the clean-GT comparison
+# can then reward them). CALIBRATED from the a6300 + lens via DxO's lens-measured
+# corrections (eval.calibrate_optics on the DxO baseline/CA/sharp DNGs of DSC00034):
+# a mild ~0.54px Gaussian PSF and ASYMMETRIC lateral CA (R ~+1.35px at the corner,
+# B ~0). psf_sigma_corner == psf_sigma here -- field variation wasn't measured (one
+# global sigma); refine if a per-region PSF is calibrated later.
+OPTICS = dict(psf_sigma=0.543, psf_sigma_corner=0.543, ca_R=1.35, ca_B=-0.03)
 
 
 def load_scenes(scenes=SCENES):

@@ -32,6 +32,22 @@ def test_calibrate_recovers_injected_ca(sharp):
         assert abs(r["ca_px"] - inj) < 0.4, f"ca_px {r['ca_px']} != {inj}"
 
 
+def test_calibrate_recovers_asymmetric_ca(sharp):
+    """Real lenses split R/B unevenly (the a6300 measured R=+1.35, B~0) -- the
+    per-channel ca_R/ca_B path must recover each independently."""
+    plain = syn.apply_optics(sharp, psf_sigma=0.0, ca_R=2.5, ca_B=-0.5)
+    r = cal.calibrate(plain, sharp)
+    assert abs(r["ca_R"] - 2.5) < 0.4, f"ca_R {r['ca_R']} != +2.5"
+    assert abs(r["ca_B"] + 0.5) < 0.4, f"ca_B {r['ca_B']} != -0.5"
+
+
+def test_symmetric_ca_still_matches(sharp):
+    """ca_px (symmetric) must stay identical to the explicit ca_R=+x, ca_B=-x form."""
+    a = syn.apply_optics(sharp, ca_px=3.0)
+    b = syn.apply_optics(sharp, ca_R=3.0, ca_B=-3.0)
+    assert float(np.abs(a - b).max()) == 0.0
+
+
 def test_calibrate_recovers_injected_blur(sharp):
     for inj in (1.0, 2.5):
         plain = syn.apply_optics(sharp, psf_sigma=inj, ca_px=0.0)

@@ -20,7 +20,7 @@ from . import pipeline_runner as pr
 _CFA = {"GRBG": np.array([[1, 0], [2, 1]]), "RGGB": np.array([[0, 1], [1, 2]])}
 
 
-def apply_optics(img, psf_sigma=0.0, psf_sigma_corner=None, ca_px=0.0):
+def apply_optics(img, psf_sigma=0.0, psf_sigma_corner=None, ca_px=0.0, ca_R=None, ca_B=None):
     """Inject a KNOWN optical degradation into a full-res frame, BEFORE the sensor
     samples it -- a (optionally field-varying) Gaussian PSF blur + radial lateral
     chromatic aberration. This is what was missing from the forward model: it gives
@@ -34,9 +34,11 @@ def apply_optics(img, psf_sigma=0.0, psf_sigma_corner=None, ca_px=0.0):
     psf_sigma_corner  : blur std at the corner; if set != psf_sigma, the blur grows
                         radially (a crude field-varying PSF -- the case the per-tile
                         aberration deblur is meant to beat a global deblur on).
-    ca_px             : lateral-CA channel shift (px) at the image corner. R is
-                        magnified outward by this, B inward (opposite radial shift),
-                        G left alone -- the radial R/B split real lenses produce.
+    ca_px             : lateral-CA corner shift (px), SYMMETRIC -- R magnified
+                        outward by +ca_px, B inward by -ca_px, G left alone.
+    ca_R, ca_B        : signed per-channel corner shifts (px) that OVERRIDE the
+                        symmetric default -- real lenses are asymmetric (e.g. the
+                        a6300 here measured R=+1.35, B~0). Positive = outward.
     """
     H, W = img.shape[:2]
     out = img.astype(np.float32)
@@ -50,11 +52,15 @@ def apply_optics(img, psf_sigma=0.0, psf_sigma_corner=None, ca_px=0.0):
             r = (r / r.max())[..., None]
             out = cv2.GaussianBlur(out, (0, 0), psf_sigma) * (1 - r) + \
                   cv2.GaussianBlur(out, (0, 0), cc) * r
-    if ca_px and ca_px > 0:
+    # lateral CA as a per-channel radial magnification (signed corner shift, px)
+    cR = ca_R if ca_R is not None else +ca_px
+    cB = ca_B if ca_B is not None else -ca_px
+    if cR or cB:
         rmax = np.hypot((H - 1) / 2, (W - 1) / 2)
-        m = ca_px / rmax  # per-unit-radius magnification so the corner shift = ca_px
-        for ch, sgn in ((0, +1.0), (2, -1.0)):  # R magnified out, B in
-            s = 1.0 + sgn * m
+        for ch, d in ((0, cR), (2, cB)):  # R, B; G untouched
+            if not d:
+                continue
+            s = 1.0 + d / rmax  # corner shift d => magnification s about centre
             Mc = np.float32([[s, 0, (1 - s) * (W - 1) / 2],
                              [0, s, (1 - s) * (H - 1) / 2]])
             # warpAffine wants a contiguous 2D input -- the channel slice is strided
@@ -64,7 +70,8 @@ def apply_optics(img, psf_sigma=0.0, psf_sigma_corner=None, ca_px=0.0):
 
 
 def make_synthetic_burst(gt, n=8, factor=2, max_shift=2.0, alpha=1e-4, beta=0.0,
-                         seed=0, cfa_str="GRBG", psf_sigma=0.0, psf_sigma_corner=None, ca_px=0.0):
+                         seed=0, cfa_str="GRBG", psf_sigma=0.0, psf_sigma_corner=None,
+                         ca_px=0.0, ca_R=None, ca_B=None):
     """Build a (burst dict, gt) usable by pipeline_runner.run at scale=factor.
 
     gt: float32 RGB in [0,1], H2xW2 (multiple of 2*factor recommended).
@@ -85,7 +92,7 @@ def make_synthetic_burst(gt, n=8, factor=2, max_shift=2.0, alpha=1e-4, beta=0.0,
         dy, dx = (0.0, 0.0) if i == 0 else tuple(rng.uniform(-max_shift, max_shift, 2))
         M = np.float32([[1, 0, dx * factor], [0, 1, dy * factor]])
         sh = cv2.warpAffine(gt, M, (W2, H2), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
-        sh = apply_optics(sh, psf_sigma, psf_sigma_corner, ca_px)  # lens PSF + lateral CA (sensor coords)
+        sh = apply_optics(sh, psf_sigma, psf_sigma_corner, ca_px, ca_R, ca_B)  # lens PSF + lateral CA
         lr = cv2.resize(sh, (W, H), interpolation=cv2.INTER_AREA)
         bayer = np.zeros((H, W), np.float32)
         for ii in range(2):
