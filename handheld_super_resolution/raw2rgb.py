@@ -240,17 +240,119 @@ def _deblur(img, deblur_config):
     return out.squeeze(0).permute(1, 2, 0).contiguous().cpu().numpy()
 
 
+def _measured_rl_deblur(img, cfg, edge_strength=None):
+    """Measured-PSF Richardson-Lucy deblur of a linear-RGB image (numpy HWC in
+    [0, 1]), GATED by the merge's structure-tensor edge-strength field.
+
+    Opt-in alternative to the aberration stage's BOUNDED, blind Polyblur deblur
+    (selected by ``postprocessing.aberration.deblur_method == 'measured_rl'``).
+    Polyblur caps high-frequency gain at ``beta`` and its blind sigma-estimate is
+    fooled by high-contrast edges; RL is unbounded, so given a MEASURED Gaussian
+    PSF (``sigma`` -- a per-camera/scale calibration value, like ``sigma_b``, NOT a
+    blind per-tile estimate) it can target the merge's residual softness.
+
+    ``edge_strength`` is the pipeline's OWN ``l1`` field (the merge's structure
+    tensor, exposed via ``merging.expose_edge_strength`` ->
+    ``debug_dict['edge_strength']``), at this image's resolution. It is turned into
+    a [0,1] gate by ``deconv.edge_gate_from_l1`` and the sharpening is blended in
+    only at edges -- ``out = img + gate*(deconv - img)`` -- so RL does not amplify
+    flat-region noise. With no ``edge_strength`` the deconv is applied unblended
+    (gate == 1) and a warning is emitted (the gate is the whole point).
+
+    The (chromatic) defringe is NOT done here -- the caller runs the existing
+    ResUNet defringer afterwards. Returns numpy HWC float32.
+    """
+    import torch
+    import torch.nn.functional as F
+    from .deconv import richardson_lucy_fft, wiener_fft, gaussian_psf, edge_gate_from_l1
+
+    sigma = float(cfg.get("sigma", 1.1))
+    iters = int(cfg.get("iters", 3))
+    method = str(cfg.get("method", "rl"))
+    nsr = float(cfg.get("nsr", 1e-2))
+
+    t = torch.as_tensor(np.ascontiguousarray(img), dtype=torch.float32, device="cuda")
+    t = t.permute(2, 0, 1).clamp(0.0, 1.0)  # (3, H, W)
+    H, W = t.shape[-2:]
+    psf = gaussian_psf(sigma)
+
+    out = torch.empty_like(t)
+    for c in range(t.shape[0]):
+        if method == "rl":
+            out[c] = richardson_lucy_fft(t[c], psf, iters=iters, clip=True)
+        elif method == "wiener":
+            out[c] = wiener_fft(t[c], psf, nsr=nsr).clamp(0.0, 1.0)
+        else:
+            raise ValueError(f"unknown deconv method {method!r} (use 'rl' or 'wiener')")
+
+    if edge_strength is not None:
+        gate = edge_gate_from_l1(
+            edge_strength,
+            lo_pct=float(cfg.get("gate_lo_pct", 50)),
+            hi_pct=float(cfg.get("gate_hi_pct", 90)),
+        ).to(t.device)
+        if gate.shape != (H, W):  # align the gate to the image (soft mask -> bilinear)
+            gate = F.interpolate(gate[None, None], size=(H, W),
+                                 mode="bilinear", align_corners=False)[0, 0]
+        out = t + gate[None] * (out - t)  # blend only at edges
+    else:
+        warnings.warn(
+            "measured_rl deblur ran without an edge_strength gate (set "
+            "merging.expose_edge_strength: true); deconvolving the whole frame, "
+            "which amplifies flat-region noise.")
+
+    out = out.clamp(0.0, 1.0)
+    result = out.permute(1, 2, 0).contiguous().cpu().numpy()
+
+    # optional edge-preserving bilateral to strip the noise the deconv amplified
+    if bool(cfg.get("bilateral", False)):
+        import cv2
+        sc = cfg.get("bilateral_sigma_color", None)
+        if sc is None:
+            # ~3x the frame's high-pass std (a noise-floor proxy), as in eval.deconv
+            g = result.mean(2).astype(np.float32)
+            sc = 3.0 * float((g - cv2.GaussianBlur(g, (0, 0), 2.0)).std())
+        sc = max(float(sc), 1e-4)
+        result = cv2.bilateralFilter(np.ascontiguousarray(result), d=5,
+                                     sigmaColor=sc, sigmaSpace=3)
+        result = np.clip(result, 0.0, 1.0).astype(np.float32)
+    return result.astype(np.float32)
+
+
 _ABERRATION_MODEL = None
 
 
-def _aberration(img, cfg):
+def _aberration(img, cfg, edge_strength=None):
     """Two-stage optical-aberration correction on linear-RGB HWC in [0, 1]:
-    per-tile (spatially-varying) Polyblur deblur + a learned ResUNet chromatic
-    defringer. Vendored from teboli/fast_two_stage_psf_correction (MIT). The model
-    (with its checkpoint) is cached across calls, keyed on its build parameters.
+    a deblur stage + a learned ResUNet chromatic defringer. Vendored from
+    teboli/fast_two_stage_psf_correction (MIT). The model (with its checkpoint) is
+    cached across calls, keyed on its build parameters.
+
+    The deblur stage is selected by ``cfg.deblur_method`` (default ``polyblur``):
+      * ``polyblur`` -- the shipped per-tile (spatially-varying) blind, bounded
+        Polyblur deblur (unchanged behavior);
+      * ``measured_rl`` -- an opt-in measured-PSF Richardson-Lucy deconvolution
+        (``_measured_rl_deblur``), gated by the merge's structure-tensor
+        ``edge_strength`` field. In this mode the deblur is run first on the CPU/GPU
+        and the model is invoked for the DEFRINGE only (``do_deblur=False``).
     """
     import torch
     from .aberration import AberrationCorrection
+
+    deblur_method = str(cfg.get("deblur_method", "polyblur"))
+    do_deblur = bool(cfg.get("do_deblur", True))
+    do_defringe = bool(cfg.get("do_defringe", True))
+
+    if deblur_method == "measured_rl":
+        # Measured-PSF RL replaces the Polyblur deblur; the model then defringes.
+        if do_deblur:
+            img = _measured_rl_deblur(img, cfg, edge_strength=edge_strength)
+        model_do_deblur = False
+    elif deblur_method == "polyblur":
+        model_do_deblur = do_deblur
+    else:
+        raise ValueError(
+            f"unknown deblur_method {deblur_method!r} (use 'polyblur' or 'measured_rl')")
 
     global _ABERRATION_MODEL
     key = (cfg.get("model_type", "super_tiny"), int(cfg.get("patch_size", 400)),
@@ -266,16 +368,21 @@ def _aberration(img, cfg):
     t = t.permute(2, 0, 1).unsqueeze(0).clamp(0.0, 1.0)  # (1, 3, H, W)
     out = model(t, c=float(cfg.get("c", 0.416)), sigma_b=float(cfg.get("sigma_b", 0.358)),
                 alpha=float(cfg.get("alpha", 3.0)), b=float(cfg.get("beta", 3.0)),
-                do_deblur=bool(cfg.get("do_deblur", True)),
-                do_defringe=bool(cfg.get("do_defringe", True)))
+                do_deblur=model_do_deblur,
+                do_defringe=do_defringe)
     return out.squeeze(0).permute(1, 2, 0).contiguous().cpu().numpy()
 
 
 def postprocess(raw, img=None, do_color_correction=True, do_tonemapping=True,
                 do_gamma=True, sharpening_config=None, do_devignette=False, xyz2cam=None,
-                deblur_config=None, aberration_config=None):
+                deblur_config=None, aberration_config=None, edge_strength=None):
     """
     Convert a raw image to jpg image.
+
+    ``edge_strength`` (optional) is the merge's structure-tensor l1 field (from
+    ``debug_dict['edge_strength']`` when ``merging.expose_edge_strength`` is on),
+    used only by the opt-in ``aberration.deblur_method == 'measured_rl'`` path to
+    gate the deconvolution. Ignored otherwise.
     """
     if img is None:
         ## Rawpy processing - whole stack
@@ -290,7 +397,7 @@ def postprocess(raw, img=None, do_color_correction=True, do_tonemapping=True,
             img = np.clip(img, 0.0, 1.0)
         ## Aberration (Stage B) > deblur (Stage A) > sharpen -- mutually exclusive
         if aberration_config is not None and aberration_config.enabled:
-            img = _aberration(img, aberration_config)
+            img = _aberration(img, aberration_config, edge_strength=edge_strength)
         elif deblur_config is not None and deblur_config.enabled:
             img = _deblur(img, deblur_config)
         elif sharpening_config is not None and sharpening_config.enabled:

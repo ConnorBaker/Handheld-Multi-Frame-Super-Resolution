@@ -27,7 +27,7 @@ SEL_HARD_THRESHOLD = 0
 SEL_LINEAR = 1
 
 
-def estimate_kernels(img, config):
+def estimate_kernels(img, config, return_l1=False):
     """
     Implementation of Alg. 5: ComputeKernelCovariance
     Returns the kernels covariance matrices for the frame J_n, sampled at the
@@ -42,13 +42,21 @@ def estimate_kernels(img, config):
         options
     config : OmegaConf object
         parameters.
+    return_l1 : bool, optional
+        When True, also return the structure tensor's large-eigenvalue field
+        ``l1`` (imshape_y//2, imshape_x//2) -- the across-edge edge-strength signal
+        the merge already computes and discards (see ``estimate_cov_cupy``). Used
+        to gate a measured-PSF deconvolution. Default off so the return value is
+        unchanged for the merge.
 
     Returns
     -------
     covs : device Array[imshape_y//2, imshape_x//2, 2, 2]
         Covariance matrices Omega_n, sampled at the center of each bayer quad.
+    l1 : device Array[imshape_y//2, imshape_x//2]
+        (only when ``return_l1``) structure-tensor large eigenvalue field.
 
-    """    
+    """
     verbose_3 = config.verbose >= 3
 
 
@@ -96,6 +104,10 @@ def estimate_kernels(img, config):
     # shape [y, x, 2]; the convolution reduces each spatial dim by 1
     full_grads = cp.asarray(th_full_grad.squeeze().permute(1, 2, 0).contiguous())
 
+    if return_l1:
+        covs, l1 = estimate_cov_cupy(full_grads, k_detail, k_denoise, D_th, D_tr,
+                                     k_stretch, k_shrink, selection_law, return_l1=True)
+        return covs, l1
     covs = estimate_cov_cupy(full_grads, k_detail, k_denoise, D_th, D_tr,
                              k_stretch, k_shrink, selection_law)
     return covs

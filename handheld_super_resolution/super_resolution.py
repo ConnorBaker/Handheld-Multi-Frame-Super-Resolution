@@ -33,6 +33,7 @@ from .robustness import init_robustness, compute_robustness
 from .utils_dng import load_dng_burst
 from .fast_monte_carlo import run_fast_MC
 from .kernels import estimate_kernels
+from .cupy_ops import upscale_warp_stats_cupy
 from .merge import merge, merge_ref
 from . import raw2rgb
 
@@ -172,8 +173,14 @@ def main(ref_img, comp_imgs, config):
         stream.synchronize()
     
     #### Ref kernel estimation
-    cuda_kernels = estimate_kernels_(cuda_ref_img, config)
-    
+    # Optionally expose the structure-tensor edge-strength field (l1) the merge
+    # already computes (and otherwise discards). Default off -> identical behavior.
+    expose_edge_strength = bool(config.merging.get("expose_edge_strength", False))
+    if expose_edge_strength:
+        cuda_kernels, ref_l1 = estimate_kernels_(cuda_ref_img, config, return_l1=True)
+    else:
+        cuda_kernels = estimate_kernels_(cuda_ref_img, config)
+
     #### Merge ref
     if accumulate_r:     
         merge_ref_(cuda_ref_img, cuda_kernels,
@@ -195,6 +202,28 @@ def main(ref_img, comp_imgs, config):
     
     if accumulate_r :
         debug_dict['accumulated robustness'] = cp.asnumpy(accumulated_r)
+
+    if expose_edge_strength:
+        # Bring the grey-resolution l1 field to OUTPUT resolution so a postprocess
+        # gate aligns with the merged image. Reuse the pipeline's Dogson upscale
+        # (grey -> native, the x2 bayer step); then resize to output size when
+        # scale != 1 (the gate is a soft blend mask, so bilinear is fine).
+        l1_native = upscale_warp_stats_cupy(ref_l1[None], True)[0]  # (H, W)
+        # upscale_warp_stats_cupy fills out-of-bounds border samples with inf
+        # (=> robustness 0 in its usual use) and its biquadratic Dogson kernel has
+        # negative lobes that can undershoot a non-negative field. l1 is an
+        # eigenvalue energy (>= 0); "no data" at the border means no edge -> 0, so
+        # sanitize non-finite to 0 and clamp the interpolation undershoot to 0.
+        l1_native = cp.nan_to_num(l1_native, nan=0.0, posinf=0.0, neginf=0.0)
+        l1_native = cp.maximum(l1_native, 0.0)
+        if l1_native.shape != tuple(output_size):
+            import torch as _th
+            import torch.nn.functional as _F
+            l1_t = _th.as_tensor(l1_native)[None, None]
+            l1_t = _F.interpolate(l1_t, size=tuple(output_size),
+                                  mode="bilinear", align_corners=False)
+            l1_native = cp.asarray(l1_t[0, 0].contiguous())
+        debug_dict['edge_strength'] = cp.asnumpy(l1_native)
 
     return num, debug_dict
 
@@ -338,6 +367,7 @@ def process(burst_path, config):
                                            xyz2cam,
                                            deblur_config=config.postprocessing.get("deblur", None),
                                            aberration_config=config.postprocessing.get("aberration", None),
+                                           edge_strength=debug_dict.get("edge_strength", None),
                                            )
     else:
         output_image = cp.asnumpy(handheld_output)

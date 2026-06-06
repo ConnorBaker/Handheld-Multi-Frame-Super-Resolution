@@ -322,10 +322,18 @@ SEL_LINEAR = 1
 
 
 def estimate_cov_cupy(full_grads, k_detail, k_denoise, D_th, D_tr,
-                      k_stretch, k_shrink, selection_law):
+                      k_stretch, k_shrink, selection_law, return_l1=False):
     """Structure-tensor -> steerable covariance, per grey pixel.
 
     full_grads : (gh, gw, 2) gradients (gx, gy). Returns (gh, gw, 2, 2) covs.
+
+    When ``return_l1`` is True, also returns the structure tensor's large
+    eigenvalue field ``l1`` (gh, gw) -- the across-edge gradient energy already
+    computed below for the anisotropy ``A`` and otherwise discarded. It is the
+    edge-strength signal a measured-PSF deconvolution gates on
+    (``deconv.edge_gate_from_l1``); returning it avoids recomputing a Sobel
+    structure tensor. Default off so the return shape is unchanged for all
+    existing callers (the merge).
     """
     g = cp.asarray(full_grads, dtype=cp.float32)
     gx = g[..., 0]
@@ -389,6 +397,8 @@ def estimate_cov_cupy(full_grads, k_detail, k_denoise, D_th, D_tr,
     covs[..., 0, 1] = k1_sq * e1x * e1y + k2_sq * e2x * e2y
     covs[..., 1, 0] = covs[..., 0, 1]
     covs[..., 1, 1] = k1_sq * e1y * e1y + k2_sq * e2y * e2y
+    if return_l1:
+        return covs, l1
     return covs
 
 

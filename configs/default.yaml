@@ -32,6 +32,12 @@ robustness:
 merging:
   kernel: steerable
   selection_law: linear # options: hard_threshold, linear
+  expose_edge_strength: false  # when true, main() returns the structure-tensor
+                               #   large-eigenvalue (l1) edge-strength field in
+                               #   debug_dict['edge_strength'] at OUTPUT resolution.
+                               #   It is the gate the measured_rl deconv path uses
+                               #   (postprocessing.aberration.deblur_method). Default
+                               #   off -> main()'s return is unchanged.
   tuning:
     k_detail: SNR_based
     k_denoise: SNR_based
@@ -79,6 +85,24 @@ postprocessing:
     sigma_b: 0.358        # Polyblur blur-model intercept
     do_deblur: true
     do_defringe: true
+    deblur_method: polyblur  # which deblur the Stage-B 'do_deblur' runs. DEFAULT
+                         #   'polyblur' = the shipped per-tile blind/bounded Polyblur
+                         #   (behavior unchanged). 'measured_rl' = opt-in measured-PSF
+                         #   Richardson-Lucy deconvolution gated by the merge's
+                         #   structure-tensor edge field; the learned defringe still
+                         #   runs after it. measured_rl needs the gate -> also set
+                         #   merging.expose_edge_strength: true. The keys below apply
+                         #   ONLY to measured_rl:
+    # sigma: 1.1         # deconv Gaussian sigma -- PER-CAMERA/SCALE calibration (like
+                         #   sigma_b), NOT a blind per-tile estimate. ~1.08 *
+                         #   partial_gaussian_sigma(merge_sigma, target).
+    # iters: 3           # RL iterations (more => sharper but more noise/ringing; 3-5)
+    # method: rl         # 'rl' (preferred, less halo/noise) or 'wiener'
+    # nsr: 0.01          # Wiener noise-to-signal regularization (method: wiener only)
+    # gate_lo_pct: 50    # smoothstep low percentile of sqrt(l1) (gate ~0 below)
+    # gate_hi_pct: 90    # smoothstep high percentile of sqrt(l1) (gate ~1 above)
+    # bilateral: false   # optional edge-preserving bilateral to strip deconv noise
+    # bilateral_sigma_color:   # bilateral sigmaColor; auto ~3x flat-noise if unset
   do_devignetting: false
 
 accumulated_robustness_denoiser: 
