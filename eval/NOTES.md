@@ -704,3 +704,27 @@ Everything else (LIIF/LTE/CiaoSR/GaussianSR, wavelet-diffusion, DWSR) is learned
 hallucinates HF. Meta: the continuous-field REFRAMING is illuminating (our merge =
 SOTA's representation) but every recent NUMERIC win is a learned prior inventing HF,
 not new information -- nothing beats the optics ceiling deterministically.
+
+### Per-pixel robustness: the mask IS per-pixel; the real lever is the detection SIGNAL, not the threshold
+
+User asked: shouldn't rejection be per-pixel? It ALREADY is (verified in code). The
+mask R = clip(S*exp(-d^2/sigma^2) - t, 0, 1), 5x5-min, applied per-sample
+(wv=w*r*c, wa=w*r), accumulated per-frame. Per-pixel/per-frame: d (= |local 3x3 mean
+diff|, compute_dist_cupy -- VERIFIED), sigma^2 (SNR-adaptive per pixel via
+std_curve), s1/s2 (per-pixel flow-discontinuity). Only t,s1,s2,Mt are GLOBAL scalars;
+t is a uniform offset on an already-per-pixel field.
+- Why t looked "inert" (my probe + this one): on aligned content all frames' r shift
+  together and CANCEL in num/den (bit-identical t=0.12 vs 0.43); t only bites at the
+  margin (mixed aligned+misaligned). A property of thresholding an agreement signal,
+  not of granularity.
+- Adaptive/per-pixel t = REDUNDANT: the per-pixel d^2/sigma^2 + s1/s2 already
+  reject-hard-on-edges/motion, gentle-on-flats; t is sigma-normalized so a spatial t
+  duplicates/fights existing terms.
+- THE REAL LEVER (verified compute_dist = |local-MEAN diff|): d compares local MEANS,
+  so misalignment that PRESERVES the local mean (color-matched moving content/foliage)
+  reads d~0 -> not detected -> accepted -> SMEARED (NOTES item 3: foliage accepted
+  4.6/7 frames). Fix = a STRUCTURE/GRADIENT-aware or multi-scale d (a per-pixel SIGNAL
+  change), not an adaptive threshold.
+- Literature: Wronski/IPOL (t a global scalar); Lafenetre satellite adds a per-pixel
+  SNR weight h_n (k=w*r*h), NOT a spatial t, and h_n helps only multi-EXPOSURE bursts.
+(eval/research_robustness_perpixel.md, eval/_probe_robustness_perpixel.py)
