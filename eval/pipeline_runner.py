@@ -50,6 +50,58 @@ def _to_rgb(arr):
     return np.clip(np.nan_to_num(arr), 0, 1)
 
 
+def load_burst_arw(burst_path, max_frames=None):
+    """Load a Sony ARW burst into the same dict as ``load_burst``.
+
+    rawpy supplies Bayer pixels, CFA, black/white levels, white balance and the
+    colour matrix (Sony populates ``rgb_xyz_matrix``). The noise (alpha, beta) --
+    absent from ARW (no DNG NoiseProfile) -- comes from the darktable profile for
+    the EXIF camera + ISO via ``eval.noise_profiles``. Normalization mirrors
+    ``handheld_super_resolution.utils_dng.load_dng_burst`` (per-channel
+    (raw-black)/(white-black) * wb/wb_green). Frame 0 (sorted) is the reference.
+    """
+    import exifread
+    from . import noise_profiles
+
+    paths = sorted(Path(burst_path).glob("*.[Aa][Rr][Ww]"))  # case-insensitive .arw
+    assert paths, f"no .ARW files in {burst_path}"
+    if max_frames:
+        paths = paths[:max_frames]
+
+    def _read(path):
+        with rawpy.imread(str(path)) as raw:
+            bayer = raw.raw_image.astype(np.float32)          # astype copies -> safe after close
+            cfa = raw.raw_pattern.copy(); cfa[cfa == 3] = 1   # both greens -> 1
+            wl = float(raw.white_level); bl = raw.black_level_per_channel
+            wb = list(raw.camera_whitebalance)
+            xyz2cam = np.array(raw.rgb_xyz_matrix)[:3].astype(np.float32)
+            out = np.empty_like(bayer)
+            for i in range(2):
+                for j in range(2):
+                    ch = cfa[i, j]
+                    out[i::2, j::2] = (bayer[i::2, j::2] - bl[ch]) / (wl - bl[ch]) * (wb[ch] / wb[1])
+            return out, cfa, wb, xyz2cam
+
+    ref_raw, CFA, wb, xyz2cam = _read(paths[0])
+    raw_comp = np.array([_read(p)[0] for p in paths[1:]])
+
+    with open(paths[0], "rb") as f:
+        tags = exifread.process_file(f)
+    iso = int(str(tags.get("EXIF ISOSpeedRatings") or tags.get("Image ISOSpeedRatings")))
+    model = str(tags.get("Image Model")).strip()
+    alpha, beta = noise_profiles.lookup(model, iso)
+    std_curve, diff_curve = run_fast_MC(alpha, beta)
+    brightness = float(np.mean(ref_raw))
+    SNR = brightness / std_curve[round(1000 * brightness)]
+    cfa_t = tuple(int(x) for x in np.array(CFA).ravel())
+    return dict(
+        path=str(burst_path), ref_raw=ref_raw, raw_comp=raw_comp,
+        ISO=max(100, min(3200, iso)), tags=tags, CFA=CFA, cfa_str=_CFA_STR.get(cfa_t, "RGGB"),
+        xyz2cam=xyz2cam, wb=wb, ref_path=str(paths[0]),
+        alpha=alpha, beta=beta, std_curve=std_curve, diff_curve=diff_curve, SNR=SNR,
+    )
+
+
 def load_burst(burst_path):
     """Decode a DNG burst once. Returns a dict reusable across many configs."""
     ref_raw, raw_comp, ISO, tags, CFA, xyz2cam, wb, ref_path = load_dng_burst(burst_path)
