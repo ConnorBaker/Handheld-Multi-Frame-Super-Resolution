@@ -753,3 +753,44 @@ User: can we save an artifact for arbitrary-scale re-render + incrementalize? YE
 Literature: GSASR (representation + scale-aware-render split), LIIF/A-LIIF, BurstM,
 Unser splines, Elad-Feuer recursive/Kalman SR, online MFSR.
 (eval/research_persist_incremental.md)
+
+### The "horizontal tile seam" in merge+deconv: NO grid seam exists -- it is the louvers
+
+User (3x): merge+deconv shows "artifacting along the edges of where tiles meet...
+very clearly there along the horizontal." Pre-compaction hypothesis was the
+robustness S nearest-upsample (cupy_ops robustness_threshold cp.repeat). REFUTED by
+execution; the honest finding is there is NO fixed-tile grid seam.
+
+What is actually true (triangulated, metric-validated, visually confirmed):
+- The merge AND robustness DO use piecewise-constant per-tile flow (warp_ops:34-41
+  `al[int(lr_y/tile),int(lr_x/tile)]`; cupy_ops upscale_warp_stats same). tile=16,
+  so any seam would lock to a 16px(scale1)/32px(scale2) grid. flow_upscale_mode only
+  smooths flow BETWEEN pyramid levels, not this final per-tile->per-pixel expansion.
+  Covariance Omega is already bilinearly interpolated (continuous; not a seam source).
+- CONTENT-IMMUNE TEST (the only trustworthy one): phase-lock-fold a region to the
+  tile grid; real content (louvers) is not grid-locked -> averages out, a grid seam
+  averages in. Ratio = grid-period folded amp / off-period (27,29,37,41) control.
+  Whole-frame scan (scale 1 & 2, both axes, periods 16/32/64): ratio ~1 everywhere
+  (p95 0.7-1.5 at the true tile periods). Raw merge == merge+deconv ratio -> deconv
+  is NOT a grid-selective amplifier.
+- DECISIVE control: on the EXACT crop the user saw, grid-fold ratio ours-raw 0.55,
+  ours+deconv 0.55, DxO consensus 0.52 -- all <1, and DxO HAS NO TILES yet matches
+  ours. The horizontal bars are louver CONTENT (period ~20px ~ tile 16px), identical
+  in the tile-free render. (eval/_seam_adjudicate.py; seam_adjudicate.png.)
+
+Three eval/CLAUDE.md traps caught in a row (all "found a seam" that wasn't):
+1. FFT power-at-frequency (peak/median) -- inflated in flat regions, can't tell a
+   grid seam from HF content near the tile period. "deconv amplifies tile-period
+   10-20x" was just "deconv amplifies HF content," NOT a grid seam.
+2. ~tile-scale band-pass -- captured the louvers themselves (50% "seam" = content).
+3. phase-lock fold WITHOUT a validated positive control -- a 1%-of-(tiny-flat-)range
+   injection sat below the region's fold-noise floor and went undetected; nearly
+   shipped a false negative. Amplitude sweep -> detection threshold ~1% (textured)
+   to ~10% (flat-region) of local range; the real image is at ratio ~1 (no seam).
+Only the DxO-no-tiles control + the validated fold metric settled it.
+
+Genuine residuals (real, NOT the user's "tile seam"): faint VERTICAL streaking from
+x-flow aperture-problem noise on horizontal louver edges (x-flow noisy -1..-10px
+between adjacent tiles while y-flow is smooth ~-2px; flow has ~2% block-match
+outliers, mostly OOB-skipped by the merge). The optical edge skirt (research_bloom_
+banding.md: per-frame PSF, in DxO too, display-gain illusion under shadow-lift).
